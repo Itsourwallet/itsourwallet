@@ -209,7 +209,10 @@ export async function executePumpWinner({
   );
   if (!swapInstruction) throw new Error('PumpSwap did not produce a compatible trade instruction.');
 
-  return program.methods.executePumpSwapTrade([...swapInstruction.data]).accounts({
+  const swapData = Buffer.from(swapInstruction.data);
+  if (isBuy && swapData.length === 25) swapData[24] = 0;
+
+  return program.methods.executePumpSwapTrade([...swapData]).accounts({
     keeper,
     treasury,
     vault,
