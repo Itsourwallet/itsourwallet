@@ -1,0 +1,13 @@
+{
+  "network": "mainnet-beta",
+  "programId": "G2EYJC2fg2eH5sGw1Fr3Sk4bXqPSvQ4NVcX1BmGFzVA8",
+  "programData": "J4q4HrGWZjThw98sMb38jSLXNHhnRMoHZMMmKGrPm1wJ",
+  "upgradeAuthority": "nH1btyeurjZMWcd1Vxe32jUpkt8EcSHcabyHk25uLSc",
+  "deploymentSlot": 442381141,
+  "deploymentSignature": "PuTiUheGCVYfnw2UdK3hkVp6VYh9KAuTBAmdCDVp2cDgdD6QU7WQwC9wsKUFvocCkHm8xLGG6eiUXiqtRpExAoJ",
+  "releaseBinarySize": 361760,
+  "deployedAccountSize": 364048,
+  "releaseSha256": "2c138135abfe7ece4d652d7948aa110e287b6a06273ed2d16ddc712f6e6250fb",
+  "deployedPrefixMatches": true,
+  "nonZeroPaddingBytes": 0
+}
