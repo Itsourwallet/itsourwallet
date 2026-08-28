@@ -302,7 +302,7 @@ export function WallActions() {
     {roundEnded && <div className="round-ended-banner" role="status"><b>{expiredWinner ? 'WINNER EXPIRED' : 'ROUND ENDED'}</b><span>{expiredWinner ? 'The trade can no longer execute. Skip it to open the next round.' : 'Voting is closed. Settle the winner and open the next round.'}</span></div>}
     {roundEnded && <button className="pitch-button advance-button" type="button" disabled={Boolean(busy)} onClick={() => void advanceRound()}>{busy === 'advance' ? 'CHECKING WINNER…' : 'SETTLE & START NEXT ROUND'}</button>}
     {roundEnded && (canSkipWinner || expiredWinner) && <button className="skip-winner-button" type="button" disabled={Boolean(busy)} onClick={() => void advanceRound(true)}>SKIP REJECTED WINNER & START NEXT ROUND</button>}
-    {proposals.length === 0 ? <div className="empty compact"><strong>☻</strong><h3>THE CROWD IS QUIET</h3><p>No proposals in this on-chain round.</p></div> : proposals.map(({ publicKey, account }) =>
+    {proposals.length === 0 ? (!open && <div className="empty compact"><strong>☻</strong><h3>THE CROWD IS QUIET</h3><p>No proposals in this on-chain round.</p></div>) : proposals.map(({ publicKey, account }) =>
       <article className="proposal-card" key={publicKey.toBase58()}>
         <small>{actionName(account.action)} · {short(publicKey.toBase58())}</small>
         <h3>{account.title}</h3><p>{account.rationale || 'No manifesto supplied.'}</p><p className="proposal-details">{proposalDetails(account)}</p>

@@ -4,9 +4,11 @@ import { useCallback, useEffect, useState } from 'react';
 import { useConnection, useWallet } from '@solana/wallet-adapter-react';
 import { useWalletModal } from '@solana/wallet-adapter-react-ui';
 import { LAMPORTS_PER_SOL, PublicKey } from '@solana/web3.js';
+import { TOKEN_2022_PROGRAM_ID, TOKEN_PROGRAM_ID } from '@solana/spl-token';
 import { WallActions } from './wall-actions';
 
-type ChainState = { slot?: number; walletSol?: number; treasury?: PublicKey; treasurySol?: number; roundClosesAt?: number; error?: string };
+type TokenHolding = { mint: string; symbol?: string; name?: string; amount: number; priceUsd?: number; valueUsd?: number };
+type ChainState = { slot?: number; walletSol?: number; treasury?: PublicKey; treasurySol?: number; treasuryTokens?: TokenHolding[]; roundClosesAt?: number; error?: string };
 
 export default function Home() {
   const { connection } = useConnection();
@@ -33,14 +35,17 @@ export default function Home() {
       const roundNumber = readU64(stateInfo.data, 81);
       const roundBytes = u64Bytes(roundNumber);
       const round = PublicKey.findProgramAddressSync([new TextEncoder().encode('round'), state.toBuffer(), roundBytes], program)[0];
-      const [treasuryBalance, roundInfo] = await Promise.all([
-        connection.getBalance(vault, 'confirmed'), connection.getAccountInfo(round, 'confirmed'),
+      const [treasuryBalance, roundInfo, treasuryTokens] = await Promise.all([
+        connection.getBalance(vault, 'confirmed'),
+        connection.getAccountInfo(round, 'confirmed'),
+        fetchTokenHoldings(connection, vault),
       ]);
       setChain({
         slot,
         walletSol: walletBalance === undefined ? undefined : walletBalance / LAMPORTS_PER_SOL,
         treasury: vault,
         treasurySol: treasuryBalance / LAMPORTS_PER_SOL,
+        treasuryTokens,
         roundClosesAt: roundInfo ? readU64(roundInfo.data, 56) : undefined,
       });
     } catch (error) { setChain({ error: error instanceof Error ? error.message : 'Mainnet RPC unavailable' }); }
@@ -86,7 +91,7 @@ export default function Home() {
     <section className="hero" id="top"><p className="eyebrow">ONE WALLET. THE INTERNET HAS THE KEYS. SORT OF.</p><h1>A treasury with<br/><i>zero adult supervision.</i></h1><p className="dek">Pitch an on-chain move. Buy votes. Every five minutes, the contract obeys the loudest valid idea.</p><div className="hero-actions"><a className="primary" href="#control">POKE THE MACHINE　↘</a><a className="secondary" href="#how-it-works">HOW IT WORKS</a></div><code className={chain.error ? 'net error' : 'net'}>●　SOLANA MAINNET · {chain.slot ? `LIVE AT SLOT ${chain.slot.toLocaleString()}` : chain.error ? 'RPC NEEDS A COFFEE' : 'CALLING THE CHAIN'}</code></section>
     <section className="how" id="how-it-works"><p>HOW IT WORKS</p><h2>Four steps. That is it.</h2><div className="how-grid"><article><b>01</b><h3>CONNECT</h3><span>Connect your Solana wallet.</span></article><article><b>02</b><h3>PROPOSE</h3><span>Choose an allowed action.</span></article><article><b>03</b><h3>VOTE</h3><span>Buy votes with SOL.</span></article><article><b>04</b><h3>EXECUTE</h3><span>The winner runs.</span></article></div></section>
     <section className="control" id="control">
-      <aside className="panel" id="treasury"><Title n="01" text="THE COMMUNAL POT"/>{chain.treasury ? <div className="real-balance"><small>VERIFIED VAULT BALANCE</small><strong>{chain.treasurySol?.toLocaleString(undefined,{maximumFractionDigits:4}) ?? 'WAIT'} SOL</strong><a href={`https://solscan.io/account/${chain.treasury.toBase58()}`} target="_blank" rel="noreferrer">{short(chain.treasury.toBase58())} ↗</a></div> : <Empty title="SMART WALLET NOT DEPLOYED" text="No program ID is configured, so we refuse to invent a treasury or its balance."/>}<dl><div><dt>NETWORK</dt><dd>MAINNET-BETA</dd></div><div><dt>DATA SOURCE</dt><dd>LIVE RPC</dd></div><div><dt>CONTROL</dt><dd>SYSTEM VAULT PDA</dd></div></dl></aside>
+      <aside className="panel" id="treasury"><Title n="01" text="THE COMMUNAL POT"/>{chain.treasury ? <div className="real-balance"><small>VERIFIED VAULT BALANCE</small><strong>{chain.treasurySol?.toLocaleString(undefined,{maximumFractionDigits:4}) ?? 'WAIT'} SOL</strong><a href={`https://solscan.io/account/${chain.treasury.toBase58()}`} target="_blank" rel="noreferrer">{short(chain.treasury.toBase58())} ↗</a><TokenHoldings tokens={chain.treasuryTokens}/></div> : <Empty title="SMART WALLET NOT DEPLOYED" text="No program ID is configured, so we refuse to invent a treasury or its balance."/>}<dl><div><dt>NETWORK</dt><dd>MAINNET-BETA</dd></div><div><dt>DATA SOURCE</dt><dd>LIVE RPC</dd></div><div><dt>CONTROL</dt><dd>SYSTEM VAULT PDA</dd></div></dl></aside>
       <article className="machine"><div className={'ring ' + (seconds === 0 ? 'is-ended' : '')} aria-live="polite" style={{'--progress': `${Math.min(360, ((seconds ?? 0) / 300) * 360)}deg`} as React.CSSProperties}><div><span>NEXT GROUP DECISION</span><strong>{seconds === undefined ? 'WAIT' : seconds === 0 ? 'ENDED' : String(seconds).padStart(2,'0')}</strong><small>{seconds === 0 ? 'ROUND COMPLETE' : 'SECONDS'}</small><mark>{chain.treasury ? seconds && seconds > 0 ? 'ROUND OPEN' : 'START NEXT ROUND ↓' : 'WAITING FOR PROGRAM'}</mark></div></div><p>THE CROWD PICKS THE WINNER. THE CODE CHECKS ITS HOMEWORK.</p><section className="fees"><div>PROPOSAL BASE<b>0.1000 SOL</b></div><div>VOTE BASE<b>0.0100 SOL</b></div><div>CHAOS LEVEL<b>{connected ? 'WALLET READY' : 'POLITE'}</b></div></section></article>
       <aside className="panel proposals"><Title n="02" text="TODAY BIG IDEAS"/><WallActions/></aside>
     </section>
@@ -95,6 +100,37 @@ export default function Home() {
   </main>;
 }
 
+async function fetchTokenHoldings(connection: ReturnType<typeof useConnection>['connection'], owner: PublicKey): Promise<TokenHolding[]> {
+  const [legacy, token2022] = await Promise.all([
+    connection.getParsedTokenAccountsByOwner(owner, { programId: TOKEN_PROGRAM_ID }, 'confirmed'),
+    connection.getParsedTokenAccountsByOwner(owner, { programId: TOKEN_2022_PROGRAM_ID }, 'confirmed'),
+  ]);
+  const amounts = new Map<string, number>();
+  for (const account of [...legacy.value, ...token2022.value]) {
+    const info = account.account.data.parsed.info as { mint: string; tokenAmount: { uiAmountString?: string | null } };
+    const amount = Number(info.tokenAmount.uiAmountString ?? 0);
+    if (Number.isFinite(amount) && amount > 0) amounts.set(info.mint, (amounts.get(info.mint) ?? 0) + amount);
+  }
+  const mints = [...amounts.keys()];
+  if (mints.length === 0) return [];
+  const response = await fetch('/api/token-prices', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ mints }) });
+  const payload = response.ok ? await response.json() as { prices?: Record<string, { name?: string; symbol?: string; priceUsd?: number }> } : {};
+  return mints.map(mint => {
+    const amount = amounts.get(mint) ?? 0;
+    const price = payload.prices?.[mint];
+    return { mint, amount, name: price?.name, symbol: price?.symbol, priceUsd: price?.priceUsd, valueUsd: price?.priceUsd === undefined ? undefined : amount * price.priceUsd };
+  }).sort((a, b) => (b.valueUsd ?? -1) - (a.valueUsd ?? -1));
+}
+
+function TokenHoldings({ tokens }: { tokens?: TokenHolding[] }) {
+  if (!tokens) return <div className="token-holdings loading">READING TOKEN ACCOUNTS…</div>;
+  if (tokens.length === 0) return <div className="token-holdings empty-tokens">NO TREASURY TOKENS YET</div>;
+  const pricedTotal = tokens.reduce((sum, token) => sum + (token.valueUsd ?? 0), 0);
+  return <div className="token-holdings"><div className="token-summary"><span>TREASURY TOKENS</span><b>{pricedTotal > 0 ? formatUsd(pricedTotal) : `${tokens.length} FOUND`}</b></div>{tokens.map(token => <a className="token-row" key={token.mint} href={`https://solscan.io/token/${token.mint}`} target="_blank" rel="noreferrer"><span><b>{token.symbol || short(token.mint)}</b><small>{token.name || short(token.mint)}</small></span><span><b>{formatTokenAmount(token.amount)}</b><small>{token.valueUsd === undefined ? 'PRICE UNAVAILABLE' : `${formatUsd(token.valueUsd)} · ${formatUsd(token.priceUsd ?? 0)} EACH`}</small></span></a>)}</div>;
+}
+
+function formatTokenAmount(value: number) { return value.toLocaleString(undefined, { maximumFractionDigits: value < 1 ? 8 : 4 }); }
+function formatUsd(value: number) { return value.toLocaleString(undefined, { style: 'currency', currency: 'USD', maximumFractionDigits: value < 0.01 ? 6 : 2 }); }
 function readU64(bytes: Uint8Array, offset: number) { let value = 0; for (let i = 7; i >= 0; i--) value = value * 256 + bytes[offset + i]; return value; }
 function u64Bytes(value: number) { const bytes = new Uint8Array(8); for (let i = 0; i < 8; i++) { bytes[i] = value % 256; value = Math.floor(value / 256); } return bytes; }
 function short(value:string){return `${value.slice(0,4)}…${value.slice(-4)}`}
