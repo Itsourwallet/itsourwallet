@@ -58,7 +58,7 @@ export function WallActions() {
       }
 
       const winnerId = liveRound.winningProposal as BN | null;
-      if (winnerId && !skipWinner) {
+      if (winnerId !== null && winnerId !== undefined && !skipWinner) {
         const [winner] = PublicKey.findProgramAddressSync([
           new TextEncoder().encode('proposal'), round.toBuffer(), Uint8Array.from(winnerId.toArray('le', 8)),
         ], programId);
@@ -89,7 +89,7 @@ export function WallActions() {
         }).rpc();
       }
       setCanSkipWinner(false);
-      setNotice(skipWinner ? 'Rejected winner skipped. The next round is open.' : winnerId ? 'Winner certified. The next round is open.' : 'Empty round archived. Fresh nonsense is welcome.');
+      setNotice(skipWinner ? 'Rejected winner skipped. The next round is open.' : winnerId !== null && winnerId !== undefined ? 'Winner certified. The next round is open.' : 'Empty round archived. Fresh nonsense is welcome.');
       await refresh();
       refreshPageBalances();
     } catch (error) {
@@ -306,7 +306,7 @@ export function WallActions() {
       }
 
       const winnerId = liveRound.winningProposal as BN | null;
-      if (winnerId && !skipWinner) {
+      if (winnerId !== null && winnerId !== undefined && !skipWinner) {
         const [winner] = PublicKey.findProgramAddressSync([
           new TextEncoder().encode('proposal'), round.toBuffer(), Uint8Array.from(winnerId.toArray('le', 8)),
         ], programId);
@@ -337,7 +337,7 @@ export function WallActions() {
         }).rpc();
       }
       setCanSkipWinner(false);
-      setNotice(skipWinner ? 'Rejected winner skipped. The next round is open.' : winnerId ? 'Winner certified. The next round is open.' : 'Empty round archived. Fresh nonsense is welcome.');
+      setNotice(skipWinner ? 'Rejected winner skipped. The next round is open.' : winnerId !== null && winnerId !== undefined ? 'Winner certified. The next round is open.' : 'Empty round archived. Fresh nonsense is welcome.');
       await refresh();
       refreshPageBalances();
     } catch (error) {
