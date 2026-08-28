@@ -10,6 +10,7 @@ const keypairJson = process.env.KEEPER_KEYPAIR_JSON;
 const programId = new PublicKey(process.env.PUBLIC_WALLET_PROGRAM_ID || DEFAULT_PROGRAM_ID);
 const pollMs = Math.max(5_000, Number(process.env.KEEPER_POLL_MS || 12_000));
 const minimumKeeperLamports = Math.max(1_000_000, Math.round(Number(process.env.KEEPER_MIN_SOL || 0.02) * 1_000_000_000));
+const roundEndScreenMs = Math.max(10_000, Number(process.env.ROUND_END_SCREEN_MS || 10_000));
 const runOnce = process.env.KEEPER_RUN_ONCE === 'true';
 const dryRun = process.env.KEEPER_DRY_RUN === 'true';
 
@@ -38,6 +39,12 @@ function log(message: string, details: Record<string, unknown> = {}) {
 }
 
 async function openNextRound(round: PublicKey, roundState: any) {
+  const settledAtMs = Number((roundState.settledAt as BN).toString()) * 1_000;
+  const remainingMs = settledAtMs + roundEndScreenMs - Date.now();
+  if (remainingMs > 0) {
+    log('showing completed round before opening the next one', { round: (roundState.number as BN).toString(), remainingMs });
+    await new Promise(resolve => setTimeout(resolve, remainingMs));
+  }
   const state = await program.account.treasury.fetch(treasury);
   if (!(state.roundNumber as BN).eq(roundState.number as BN)) return;
   const nextNumber = (roundState.number as BN).add(new BN(1));
@@ -90,7 +97,7 @@ async function processRound() {
     }
 
     const winnerId = roundState.winningProposal as BN | null;
-    if (!winnerId) {
+    if (winnerId === null || winnerId === undefined) {
       await openNextRound(round, roundState);
       return;
     }
@@ -133,7 +140,7 @@ async function processRound() {
 }
 
 async function main() {
-  log('keeper started', { keeper: keeper.publicKey.toBase58(), program: programId.toBase58(), pollMs, dryRun });
+  log('keeper started', { keeper: keeper.publicKey.toBase58(), program: programId.toBase58(), pollMs, roundEndScreenMs, dryRun });
   await processRound();
   if (!runOnce) setInterval(() => void processRound(), pollMs);
 }

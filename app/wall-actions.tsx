@@ -17,6 +17,9 @@ import {
 
 type ProposalView = { publicKey: PublicKey; account: any };
 
+const KEEPER_ADDRESS = new PublicKey(process.env.NEXT_PUBLIC_KEEPER_ADDRESS || 'DErudid3kspiPZSteJXK9VJByZxv22eNJb7Ap6Z6TEKQ');
+const KEEPER_MIN_LAMPORTS = 20_000_000;
+
 export function WallActions() {
   const { connection } = useConnection();
   const wallet = useAnchorWallet();
@@ -27,6 +30,8 @@ export function WallActions() {
   const [busy, setBusy] = useState('');
   const [notice, setNotice] = useState('');
   const [maxBuySol, setMaxBuySol] = useState<number>();
+  const [keeperHasGas, setKeeperHasGas] = useState<boolean>();
+  const [canSkipWinner, setCanSkipWinner] = useState(false);
   const [sendMaximum, setSendMaximum] = useState<{ display: string; baseUnits: string }>();
   const [open, setOpen] = useState(false);
   const [title, setTitle] = useState('');
@@ -38,7 +43,68 @@ export function WallActions() {
   const [limit, setLimit] = useState('');
 
   const program = useMemo(() => {
-    if (!wallet) return undefined;
+    const advanceRound = async (skipWinner = false) => {
+    if (!program || !wallet || !round) return;
+    setBusy('advance'); setNotice('');
+    try {
+      const programId = program.programId as PublicKey;
+      const [treasury] = PublicKey.findProgramAddressSync([new TextEncoder().encode('treasury')], programId);
+      const [vault] = PublicKey.findProgramAddressSync([new TextEncoder().encode('vault')], programId);
+      let liveRound = await program.account.round.fetch(round);
+      if ('open' in liveRound.status) {
+        if (Math.floor(Date.now() / 1000) < Number(liveRound.closesAt.toString())) throw new Error('This round is still collecting bad ideas.');
+        await program.methods.settleRound().accounts({ keeper: wallet.publicKey, treasury, round }).rpc();
+        liveRound = await program.account.round.fetch(round);
+      }
+
+      const winnerId = liveRound.winningProposal as BN | null;
+      if (winnerId && !skipWinner) {
+        const [winner] = PublicKey.findProgramAddressSync([
+          new TextEncoder().encode('proposal'), round.toBuffer(), Uint8Array.from(winnerId.toArray('le', 8)),
+        ], programId);
+        let winnerState = await program.account.proposal.fetch(winner);
+        if ('voting' in winnerState.status) {
+          await program.methods.markWinner().accounts({ keeper: wallet.publicKey, treasury, round, proposal: winner }).rpc();
+          winnerState = await program.account.proposal.fetch(winner);
+        }
+        if ('won' in winnerState.status) {
+          if ('hold' in winnerState.action) {
+            await program.methods.executeHold().accounts({ keeper: wallet.publicKey, treasury, round, proposal: winner }).rpc();
+          } else if ('transferToApprovedRecipient' in winnerState.action) {
+            await executeTransferWinner({ connection, program, keeper: wallet.publicKey, treasury, round, vault, proposal: winner, proposalState: winnerState });
+          } else {
+            await executePumpWinner({ connection, program, keeper: wallet.publicKey, treasury, round, vault, proposal: winner, proposalState: winnerState });
+          }
+        }
+      }
+
+      const treasuryState = await program.account.treasury.fetch(treasury);
+      if ((treasuryState.roundNumber as BN).eq(liveRound.number as BN)) {
+        const nextNumber = (liveRound.number as BN).add(new BN(1));
+        const [nextRound] = PublicKey.findProgramAddressSync([
+          new TextEncoder().encode('round'), treasury.toBuffer(), Uint8Array.from(nextNumber.toArray('le', 8)),
+        ], programId);
+        await program.methods.openNextRound().accounts({
+          keeper: wallet.publicKey, treasury, previousRound: round, round: nextRound, systemProgram: SystemProgram.programId,
+        }).rpc();
+      }
+      setCanSkipWinner(false);
+      setNotice(skipWinner ? 'Rejected winner skipped. The next round is open.' : winnerId ? 'Winner certified. The next round is open.' : 'Empty round archived. Fresh nonsense is welcome.');
+      await refresh();
+      refreshPageBalances();
+    } catch (error) {
+      const message = readError(error);
+      if (message.includes('treasury safety limit') || message.includes('expired') || message.includes('graduated')) {
+        setCanSkipWinner(true);
+        setNotice(message + ' The trade did not happen. You may now skip this rejected winner and open the next round.');
+      } else {
+        setNotice(message);
+      }
+    }
+    finally { setBusy(''); }
+  };
+
+  if (!wallet) return undefined;
     const configured = process.env.NEXT_PUBLIC_PUBLIC_WALLET_PROGRAM_ID;
     if (!configured) return undefined;
     const provider = new AnchorProvider(connection, wallet, { commitment: 'confirmed' });
@@ -49,14 +115,18 @@ export function WallActions() {
 
   const refresh = useCallback(async () => {
     setObservedAt(Math.floor(Date.now() / 1000));
-    if (!program) { setProposals([]); setRoundState(undefined); setMaxBuySol(undefined); return; }
+    if (!program) { setProposals([]); setRoundState(undefined); setMaxBuySol(undefined); setKeeperHasGas(undefined); return; }
     try {
       const [treasury] = PublicKey.findProgramAddressSync([new TextEncoder().encode('treasury')], program.programId);
       const state = await program.account.treasury.fetchNullable(treasury);
-      if (!state) { setProposals([]); setRoundState(undefined); setMaxBuySol(undefined); return; }
+      if (!state) { setProposals([]); setRoundState(undefined); setMaxBuySol(undefined); setKeeperHasGas(undefined); return; }
       const [vault] = PublicKey.findProgramAddressSync([new TextEncoder().encode('vault')], program.programId);
-      const vaultLamports = await connection.getBalance(vault, 'confirmed');
+      const [vaultLamports, keeperLamports] = await Promise.all([
+        connection.getBalance(vault, 'confirmed'),
+        connection.getBalance(KEEPER_ADDRESS, 'confirmed'),
+      ]);
       setMaxBuySol(calculateBuyCapLamports(state, vaultLamports) / 1_000_000_000);
+      setKeeperHasGas(keeperLamports >= KEEPER_MIN_LAMPORTS);
       const number = state.roundNumber as BN;
       const [currentRound] = PublicKey.findProgramAddressSync([
         new TextEncoder().encode('round'), treasury.toBuffer(), Uint8Array.from(number.toArray('le', 8)),
@@ -81,7 +151,7 @@ export function WallActions() {
 
   useEffect(() => {
     const initial = window.setTimeout(() => void refresh(), 0);
-    const timer = window.setInterval(() => void refresh(), 12_000);
+    const timer = window.setInterval(() => void refresh(), 5_000);
     return () => { window.clearTimeout(initial); window.clearInterval(timer); };
   }, [refresh]);
 
@@ -221,14 +291,95 @@ export function WallActions() {
   };
 
 
+  const advanceRound = async (skipWinner = false) => {
+    if (!program || !wallet || !round) return;
+    setBusy('advance'); setNotice('');
+    try {
+      const programId = program.programId as PublicKey;
+      const [treasury] = PublicKey.findProgramAddressSync([new TextEncoder().encode('treasury')], programId);
+      const [vault] = PublicKey.findProgramAddressSync([new TextEncoder().encode('vault')], programId);
+      let liveRound = await program.account.round.fetch(round);
+      if ('open' in liveRound.status) {
+        if (Math.floor(Date.now() / 1000) < Number(liveRound.closesAt.toString())) throw new Error('This round is still collecting bad ideas.');
+        await program.methods.settleRound().accounts({ keeper: wallet.publicKey, treasury, round }).rpc();
+        liveRound = await program.account.round.fetch(round);
+      }
+
+      const winnerId = liveRound.winningProposal as BN | null;
+      if (winnerId && !skipWinner) {
+        const [winner] = PublicKey.findProgramAddressSync([
+          new TextEncoder().encode('proposal'), round.toBuffer(), Uint8Array.from(winnerId.toArray('le', 8)),
+        ], programId);
+        let winnerState = await program.account.proposal.fetch(winner);
+        if ('voting' in winnerState.status) {
+          await program.methods.markWinner().accounts({ keeper: wallet.publicKey, treasury, round, proposal: winner }).rpc();
+          winnerState = await program.account.proposal.fetch(winner);
+        }
+        if ('won' in winnerState.status) {
+          if ('hold' in winnerState.action) {
+            await program.methods.executeHold().accounts({ keeper: wallet.publicKey, treasury, round, proposal: winner }).rpc();
+          } else if ('transferToApprovedRecipient' in winnerState.action) {
+            await executeTransferWinner({ connection, program, keeper: wallet.publicKey, treasury, round, vault, proposal: winner, proposalState: winnerState });
+          } else {
+            await executePumpWinner({ connection, program, keeper: wallet.publicKey, treasury, round, vault, proposal: winner, proposalState: winnerState });
+          }
+        }
+      }
+
+      const treasuryState = await program.account.treasury.fetch(treasury);
+      if ((treasuryState.roundNumber as BN).eq(liveRound.number as BN)) {
+        const nextNumber = (liveRound.number as BN).add(new BN(1));
+        const [nextRound] = PublicKey.findProgramAddressSync([
+          new TextEncoder().encode('round'), treasury.toBuffer(), Uint8Array.from(nextNumber.toArray('le', 8)),
+        ], programId);
+        await program.methods.openNextRound().accounts({
+          keeper: wallet.publicKey, treasury, previousRound: round, round: nextRound, systemProgram: SystemProgram.programId,
+        }).rpc();
+      }
+      setCanSkipWinner(false);
+      setNotice(skipWinner ? 'Rejected winner skipped. The next round is open.' : winnerId ? 'Winner certified. The next round is open.' : 'Empty round archived. Fresh nonsense is welcome.');
+      await refresh();
+      refreshPageBalances();
+    } catch (error) {
+      const message = readError(error);
+      if (message.includes('treasury safety limit') || message.includes('expired') || message.includes('graduated')) {
+        setCanSkipWinner(true);
+        setNotice(message + ' The trade did not happen. You may now skip this rejected winner and open the next round.');
+      } else {
+        setNotice(message);
+      }
+    }
+    finally { setBusy(''); }
+  };
+
   if (!wallet) return <div className="empty"><strong>☻</strong><h3>WALLET FIRST</h3><p>Join the crowd above to pitch or vote.</p></div>;
   if (!program) return <div className="empty"><strong>!</strong><h3>PROGRAM NOT CONFIGURED</h3><p>The site refuses to invent transactions.</p></div>;
 
   const roundEnded = roundState && (!('open' in roundState.status) || observedAt >= Number(roundState.closesAt.toString()));
+  const expiredWinner = Boolean(
+    roundEnded
+      && roundState?.winningProposal !== null
+      && roundState?.winningProposal !== undefined
+      && proposals.some(({ account }) =>
+        (account.id as BN).eq(roundState.winningProposal as BN)
+        && 'won' in account.status
+        && observedAt > Number((account.expiresAt as BN).toString()),
+      ),
+  );
+  const winningProposal = roundEnded && roundState?.winningProposal !== null && roundState?.winningProposal !== undefined
+    ? proposals.find(({ account }) => (account.id as BN).eq(new BN(roundState.winningProposal.toString())))
+    : undefined;
+  const winnerExecuted = Boolean(winningProposal && 'executed' in winningProposal.account.status);
+  const completedRoundMessage = winningProposal
+    ? `Winner: ${winningProposal.account.title}. ${winnerExecuted ? 'The action is confirmed on-chain.' : 'The keeper is executing it now.'} The next round opens in about 10 seconds.`
+    : 'No proposal won this round. The next round opens in about 10 seconds.';
 
   return <div className="wall-actions">
     <p className="vote-help"><b>HOW TO VOTE</b><span>Every live proposal has a +1 VOTE button. One vote starts at 0.01 SOL.</span></p>
-    {roundEnded && <div className="round-ended-banner keeper-settling" role="status"><b>KEEPER IS SETTLING</b><span>Voting is closed. The automatic keeper will execute the winner and open the next round.</span></div>}
+    {roundEnded && keeperHasGas !== false && <div className="round-ended-banner keeper-settling" role="status"><b>{winnerExecuted ? 'WINNER EXECUTED' : keeperHasGas === undefined ? 'CHECKING KEEPER' : winningProposal ? 'WE HAVE A WINNER' : 'ROUND ENDED'}</b><span>{completedRoundMessage}</span></div>}
+    {roundEnded && keeperHasGas === false && <div className="round-ended-banner keeper-empty" role="status"><b>KEEPER NEEDS GAS</b><span>The automatic keeper is below 0.02 SOL. Any connected user can safely finish this round.</span></div>}
+    {roundEnded && keeperHasGas === false && <button className="pitch-button advance-button" type="button" disabled={Boolean(busy)} onClick={() => void advanceRound()}>{busy === 'advance' ? 'CHECKING WINNER…' : 'SETTLE & START NEXT ROUND'}</button>}
+    {roundEnded && keeperHasGas === false && (canSkipWinner || expiredWinner) && <button className="skip-winner-button" type="button" disabled={Boolean(busy)} onClick={() => void advanceRound(true)}>SKIP REJECTED WINNER & START NEXT ROUND</button>}
     {proposals.length === 0 ? (!open && <div className="empty compact"><strong>☻</strong><h3>THE CROWD IS QUIET</h3><p>No proposals in this on-chain round.</p></div>) : proposals.map(({ publicKey, account }) =>
       <article className="proposal-card" key={publicKey.toBase58()}>
         <small>{actionName(account.action)} · {short(publicKey.toBase58())}</small>
