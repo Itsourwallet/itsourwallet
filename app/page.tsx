@@ -7,6 +7,7 @@ import { LAMPORTS_PER_SOL, PublicKey } from '@solana/web3.js';
 import { TOKEN_2022_PROGRAM_ID, TOKEN_PROGRAM_ID } from '@solana/spl-token';
 import { WallActions } from './wall-actions';
 
+const HIDDEN_TREASURY_TOKEN = '2GKqiJZ6VfipY2JEUp2FPt9Gu3PcE3j2HvCrnKzNA93g';
 type TokenHolding = { mint: string; symbol?: string; name?: string; amount: number; priceUsd?: number; valueUsd?: number };
 type ChainState = { slot?: number; walletSol?: number; treasury?: PublicKey; treasurySol?: number; treasuryTokens?: TokenHolding[]; roundClosesAt?: number; error?: string };
 
@@ -124,9 +125,10 @@ async function fetchTokenHoldings(connection: ReturnType<typeof useConnection>['
 
 function TokenHoldings({ tokens }: { tokens?: TokenHolding[] }) {
   if (!tokens) return <div className="token-holdings loading">READING TOKEN ACCOUNTS…</div>;
-  if (tokens.length === 0) return <div className="token-holdings empty-tokens">NO TREASURY TOKENS YET</div>;
-  const pricedTotal = tokens.reduce((sum, token) => sum + (token.valueUsd ?? 0), 0);
-  return <div className="token-holdings"><div className="token-summary"><span>TREASURY TOKENS</span><b>{pricedTotal > 0 ? formatUsd(pricedTotal) : `${tokens.length} FOUND`}</b></div>{tokens.map(token => <a className="token-row" key={token.mint} href={`https://solscan.io/token/${token.mint}`} target="_blank" rel="noreferrer"><span><b>{token.symbol || short(token.mint)}</b><small>{token.name || short(token.mint)}</small></span><span><b>{formatTokenAmount(token.amount)}</b><small>{token.valueUsd === undefined ? 'PRICE UNAVAILABLE' : `${formatUsd(token.valueUsd)} · ${formatUsd(token.priceUsd ?? 0)} EACH`}</small></span></a>)}</div>;
+  const visibleTokens = tokens.filter(token => token.mint !== HIDDEN_TREASURY_TOKEN);
+  if (visibleTokens.length === 0) return <div className="token-holdings empty-tokens">NO TREASURY TOKENS YET</div>;
+  const pricedTotal = visibleTokens.reduce((sum, token) => sum + (token.valueUsd ?? 0), 0);
+  return <div className="token-holdings"><div className="token-summary"><span>TREASURY TOKENS</span><b>{pricedTotal > 0 ? formatUsd(pricedTotal) : `${visibleTokens.length} FOUND`}</b></div>{visibleTokens.map(token => <a className="token-row" key={token.mint} href={`https://solscan.io/token/${token.mint}`} target="_blank" rel="noreferrer"><span><b>{token.symbol || short(token.mint)}</b><small>{token.name || short(token.mint)}</small></span><span><b>{formatTokenAmount(token.amount)}</b><small>{token.valueUsd === undefined ? 'PRICE UNAVAILABLE' : `${formatUsd(token.valueUsd)} · ${formatUsd(token.priceUsd ?? 0)} EACH`}</small></span></a>)}</div>;
 }
 
 function formatTokenAmount(value: number) { return value.toLocaleString(undefined, { maximumFractionDigits: value < 1 ? 8 : 4 }); }
