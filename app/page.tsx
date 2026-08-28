@@ -82,7 +82,7 @@ export default function Home() {
   }, [connection, publicKey]);
 
   return <main>
-    <header className="topbar"><a className="brand" href="#top"><img src="/public-wallet-logo.png" alt="It's Our Wallet" width="40" height="40"/><span>IT'S OUR WALLET</span></a><nav><a href="#control">THE MACHINE</a><a href="#transparency">FINE PRINT</a><a href="/docs">DOCS</a></nav><CrowdWalletButton/></header>
+    <header className="topbar"><a className="brand" href="#top"><img src="/public-wallet-logo.png" alt="It&apos;s Our Wallet" width="40" height="40"/><span>IT&apos;S OUR WALLET</span></a><nav><a href="#control">THE MACHINE</a><a href="#transparency">FINE PRINT</a><a href="/docs">DOCS</a></nav><CrowdWalletButton/></header>
     <section className="hero" id="top"><p className="eyebrow">ONE WALLET. THE INTERNET HAS THE KEYS. SORT OF.</p><h1>A treasury with<br/><i>zero adult supervision.</i></h1><p className="dek">Pitch an on-chain move. Buy votes. Every five minutes, the contract obeys the loudest valid idea.</p><div className="hero-actions"><a className="primary" href="#control">POKE THE MACHINE　↘</a><a className="secondary" href="#how-it-works">HOW IT WORKS</a></div><code className={chain.error ? 'net error' : 'net'}>●　SOLANA MAINNET · {chain.slot ? `LIVE AT SLOT ${chain.slot.toLocaleString()}` : chain.error ? 'RPC NEEDS A COFFEE' : 'CALLING THE CHAIN'}</code></section>
     <section className="how" id="how-it-works"><p>HOW IT WORKS</p><h2>Four steps. That is it.</h2><div className="how-grid"><article><b>01</b><h3>CONNECT</h3><span>Connect your Solana wallet.</span></article><article><b>02</b><h3>PROPOSE</h3><span>Choose an allowed action.</span></article><article><b>03</b><h3>VOTE</h3><span>Buy votes with SOL.</span></article><article><b>04</b><h3>EXECUTE</h3><span>The winner runs.</span></article></div></section>
     <section className="control" id="control">
@@ -91,7 +91,7 @@ export default function Home() {
       <aside className="panel proposals"><Title n="02" text="TODAY BIG IDEAS"/><WallActions/></aside>
     </section>
     {connected && publicKey && <section className="wallet-card"><div><small>YOUR ACTUAL MAINNET WALLET</small><strong>{short(publicKey.toBase58())}</strong></div><div><small>VERIFIED BALANCE</small><strong>{chain.walletSol?.toLocaleString(undefined,{maximumFractionDigits:4}) ?? 'LOADING'} SOL</strong></div><a href={`https://solscan.io/account/${publicKey.toBase58()}`} target="_blank" rel="noreferrer">VIEW ON SOLSCAN ↗</a></section>}    <section className="manifesto" id="transparency"><p>THE JOKE ENDS WHERE THE SAFETY RULES BEGIN</p><h2>Most votes wins.<br/><i>Bad ideas still get rejected.</i></h2><div className="rules"><article><b>01</b><h3>BRING AN IDEA</h3><p>Every action is typed and inspected. No mystery addresses. No arbitrary calls.</p></article><article><b>02</b><h3>PAY TO SHOUT</h3><p>Votes cost real SOL and go straight into the treasury. Volume has a price.</p></article><article><b>03</b><h3>CODE, NOT VIBES</h3><p>The winner executes only if prices, limits and slippage remain safe.</p></article></div></section>
-    <footer><b>IT'S OUR WALLET</b><a href="/docs">PROGRAM PROOF & DOCS ↗</a></footer>
+    <footer><b>IT&apos;S OUR WALLET</b><a href="/docs">PROGRAM PROOF & DOCS ↗</a></footer>
   </main>;
 }
 

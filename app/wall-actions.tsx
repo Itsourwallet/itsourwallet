@@ -8,6 +8,7 @@ import { PublicKey, SystemProgram } from '@solana/web3.js';
 import idl from './onchain-idl.json';
 import {
   executePumpWinner,
+  executeTransferWinner,
   normalTokenAmountToBaseUnits,
   quotePumpBuyAmount,
   validatePumpToken,
@@ -29,8 +30,9 @@ export function WallActions() {
   const [open, setOpen] = useState(false);
   const [title, setTitle] = useState('');
   const [rationale, setRationale] = useState('');
-  const [action, setAction] = useState<'hold' | 'buy' | 'sell'>('hold');
+  const [action, setAction] = useState<'hold' | 'buy' | 'sell' | 'sendSol' | 'sendToken'>('hold');
   const [mint, setMint] = useState('');
+  const [recipient, setRecipient] = useState('');
   const [amount, setAmount] = useState('');
   const [limit, setLimit] = useState('');
 
@@ -61,11 +63,20 @@ export function WallActions() {
       setRound(currentRound);
       setRoundState(await program.account.round.fetch(currentRound));
       const rows = await program.account.proposal.all([{ memcmp: { offset: 8, bytes: currentRound.toBase58() } }]);
-      setProposals(rows.sort((a: ProposalView, b: ProposalView) => Number(b.account.votes.sub(a.account.votes))));
+      const hydrated = await Promise.all(rows.map(async (row: ProposalView) => {
+        if (!('transferToApprovedRecipient' in row.account.action)) return row;
+        const [intent] = PublicKey.findProgramAddressSync(
+          [new TextEncoder().encode('transfer-intent'), row.publicKey.toBuffer()],
+          program.programId,
+        );
+        const transfer = await program.account.transferIntent.fetchNullable(intent);
+        return { ...row, account: { ...row.account, transfer } };
+      }));
+      setProposals(hydrated.sort((a: ProposalView, b: ProposalView) => Number(b.account.votes.sub(a.account.votes))));
     } catch (error) {
       setNotice(readError(error));
     }
-  }, [program]);
+  }, [program, connection]);
 
   useEffect(() => {
     const initial = window.setTimeout(() => void refresh(), 0);
@@ -96,11 +107,16 @@ export function WallActions() {
       const [proposal] = PublicKey.findProgramAddressSync([
         new TextEncoder().encode('proposal'), currentRound.toBuffer(), Uint8Array.from(id.toArray('le', 8)),
       ], programId);
-      const target = action === 'hold' ? PublicKey.default : new PublicKey(mint.trim());
-      if (action !== 'hold') {
-        await validatePumpToken(connection, target);
+      const isSend = action === 'sendSol' || action === 'sendToken';
+      const target = action === 'hold' || action === 'sendSol' ? PublicKey.default : new PublicKey(mint.trim());
+      const recipientKey = isSend ? new PublicKey(recipient.trim()) : PublicKey.default;
+      if (action === 'buy' || action === 'sell') await validatePumpToken(connection, target);
+      if (action === 'sendToken') {
+        const mintInfo = await connection.getAccountInfo(target, 'confirmed');
+        if (!mintInfo) throw new Error('This token mint does not exist.');
       }
-      const quoteLamports = action === 'hold' ? new BN(0) : solToLamports(limit);
+
+      const quoteLamports = action === 'buy' || action === 'sell' ? solToLamports(limit) : new BN(0);
       if (action === 'buy') {
         const vaultLamports = await connection.getBalance(vault, 'confirmed');
         const buyCap = new BN(calculateBuyCapLamports(treasuryState, vaultLamports));
@@ -112,20 +128,51 @@ export function WallActions() {
         ? new BN(0)
         : action === 'buy'
           ? await quotePumpBuyAmount(connection, target, quoteLamports)
-          : await normalTokenAmountToBaseUnits(connection, target, amount);
-      const actionValue = action === 'hold' ? { hold: {} } : action === 'buy' ? { buyApprovedToken: {} } : { sellApprovedToken: {} };
-      await program.methods.createProposal({
+          : action === 'sendSol'
+            ? solToLamports(amount)
+            : await normalTokenAmountToBaseUnits(connection, target, amount);
+      const actionValue = action === 'hold'
+        ? { hold: {} }
+        : action === 'buy'
+          ? { buyApprovedToken: {} }
+          : action === 'sell'
+            ? { sellApprovedToken: {} }
+            : { transferToApprovedRecipient: {} };
+      const args = {
         action: actionValue,
         target,
         amount: rawAmount,
         maximumAmount: action === 'buy' ? quoteLamports : new BN(0),
         minimumOutput: action === 'sell' ? quoteLamports : new BN(0),
-        maxSlippageBps: 500,
+        maxSlippageBps: action === 'buy' || action === 'sell' ? 500 : 0,
         expiresAt: (roundState.closesAt as BN).add(new BN(600)),
         title: title.trim(),
         rationale: rationale.trim(),
-      }).accounts({ proposer: wallet.publicKey, treasury, round: currentRound, vault, proposal, systemProgram: SystemProgram.programId }).rpc();
-      setTitle(''); setRationale(''); setMint(''); setAmount(''); setLimit(''); setOpen(false);
+      };
+      if (isSend) {
+        const [transferIntent] = PublicKey.findProgramAddressSync(
+          [new TextEncoder().encode('transfer-intent'), proposal.toBuffer()],
+          programId,
+        );
+        await program.methods.createTransferProposal(args, recipientKey, action === 'sendSol').accounts({
+          proposer: wallet.publicKey,
+          treasury,
+          round: currentRound,
+          vault,
+          proposal,
+          transferIntent,
+          systemProgram: SystemProgram.programId,
+        }).rpc();
+      } else {
+        await program.methods.createProposal(args).accounts({
+          proposer: wallet.publicKey,
+          treasury,
+          round: currentRound,
+          vault,
+          proposal,
+          systemProgram: SystemProgram.programId,
+        }).rpc();
+      }      setTitle(''); setRationale(''); setMint(''); setRecipient(''); setAmount(''); setLimit(''); setOpen(false);
       setNotice('Idea is on-chain. The crowd may now yell with money.');
       await refresh();
       refreshPageBalances();
@@ -179,6 +226,8 @@ export function WallActions() {
         if ('won' in winnerState.status) {
           if ('hold' in winnerState.action) {
             await program.methods.executeHold().accounts({ keeper: wallet.publicKey, treasury, round, proposal: winner }).rpc();
+          } else if ('transferToApprovedRecipient' in winnerState.action) {
+            await executeTransferWinner({ connection, program, keeper: wallet.publicKey, treasury, round, vault, proposal: winner, proposalState: winnerState });
           } else {
             await executePumpWinner({ connection, program, keeper: wallet.publicKey, treasury, round, vault, proposal: winner, proposalState: winnerState });
           }
@@ -234,15 +283,18 @@ export function WallActions() {
     {proposals.length === 0 ? <div className="empty compact"><strong>☻</strong><h3>THE CROWD IS QUIET</h3><p>No proposals in this on-chain round.</p></div> : proposals.map(({ publicKey, account }) =>
       <article className="proposal-card" key={publicKey.toBase58()}>
         <small>{actionName(account.action)} · {short(publicKey.toBase58())}</small>
-        <h3>{account.title}</h3><p>{account.rationale || 'No manifesto supplied.'}</p>
+        <h3>{account.title}</h3><p>{account.rationale || 'No manifesto supplied.'}</p><p className="proposal-details">{proposalDetails(account)}</p>
         <div><b>{account.votes.toString()} VOTES</b><button type="button" disabled={Boolean(busy) || Boolean(roundEnded)} onClick={() => void vote(publicKey)}>{roundEnded ? 'VOTING CLOSED' : busy === publicKey.toBase58() ? 'SIGNING…' : '+ 1 VOTE · FROM 0.01 SOL'}</button></div>
       </article>)}
     {!roundEnded && (!open ? <button className="pitch-button" type="button" onClick={() => setOpen(true)}>+ PITCH AN IDEA · FROM 0.1 SOL</button> :
       <div className="proposal-form">
-        <label>THE MOVE<select value={action} onChange={event => setAction(event.target.value as typeof action)}><option value="hold">Hold / do nothing</option><option value="buy">Buy Pump.fun token</option><option value="sell">Sell Pump.fun token</option></select></label>
-        <label>HEADLINE<input maxLength={64} value={title} onChange={event => setTitle(event.target.value)} placeholder="Buy the frog, responsibly"/></label>
+        <label>THE MOVE<select value={action} onChange={event => setAction(event.target.value as typeof action)}><option value="hold">Hold / do nothing</option><option value="buy">Buy any Pump.fun token</option><option value="sell">Sell any Pump.fun token</option><option value="sendSol">Send SOL</option><option value="sendToken">Send a treasury token</option></select></label>
+        <label>HEADLINE<input maxLength={64} value={title} onChange={event => setTitle(event.target.value)} placeholder="Send it where the crowd says"/></label>
         <label>THE PITCH<textarea maxLength={192} value={rationale} onChange={event => setRationale(event.target.value)} placeholder="Why should strangers approve this?"/></label>
-        {action !== 'hold' && <><label>TOKEN MINT<input value={mint} onChange={event => setMint(event.target.value)} placeholder="Solana mint address"/></label>{action === 'sell' && <label>TOKENS TO SELL<input inputMode="decimal" value={amount} onChange={event => setAmount(event.target.value)} placeholder="100"/></label>}<label>{action === 'buy' ? 'MAX SOL TO SPEND' + (maxBuySol === undefined ? '' : ' · CURRENT LIMIT ' + maxBuySol.toFixed(4)) : 'MIN SOL TO RECEIVE'}<input inputMode="decimal" value={limit} onChange={event => setLimit(event.target.value)} placeholder="0.05"/></label></>}
+        {(action === 'buy' || action === 'sell' || action === 'sendToken') && <label>TOKEN MINT<input value={mint} onChange={event => setMint(event.target.value)} placeholder="Solana mint address"/></label>}
+        {(action === 'sendSol' || action === 'sendToken') && <label>RECIPIENT WALLET<input value={recipient} onChange={event => setRecipient(event.target.value)} placeholder="Solana wallet address"/></label>}
+        {(action === 'sell' || action === 'sendSol' || action === 'sendToken') && <label>{action === 'sell' ? 'TOKENS TO SELL' : action === 'sendSol' ? 'SOL TO SEND' : 'TOKENS TO SEND'}<input inputMode="decimal" value={amount} onChange={event => setAmount(event.target.value)} placeholder={action === 'sendSol' ? '0.01' : '100'}/></label>}
+        {(action === 'buy' || action === 'sell') && <label>{action === 'buy' ? 'MAX SOL TO SPEND' + (maxBuySol === undefined ? '' : ' · CURRENT LIMIT ' + maxBuySol.toFixed(4)) : 'MIN SOL TO RECEIVE'}<input inputMode="decimal" value={limit} onChange={event => setLimit(event.target.value)} placeholder="0.05"/></label>}
         <div><button type="button" className="secondary" onClick={() => setOpen(false)}>NEVER MIND</button><button type="button" className="pitch-button" disabled={Boolean(busy)} onClick={() => void submit()}>{busy === 'proposal' ? 'ASKING WALLET…' : 'PUT IT ON-CHAIN'}</button></div>
       </div>)}
     {notice && <p className="chain-notice" role="status">{notice}</p>}
@@ -268,4 +320,14 @@ function readError(error: unknown) {
   return message;
 }
 function short(value: string) { return `${value.slice(0, 4)}…${value.slice(-4)}`; }
-function actionName(action: Record<string, unknown>) { if ('buyApprovedToken' in action) return 'BUY PUMP.FUN TOKEN'; if ('sellApprovedToken' in action) return 'SELL PUMP.FUN TOKEN'; return 'HOLD'; }
+function proposalDetails(account: any) {
+  if ('transferToApprovedRecipient' in account.action) {
+    const recipient = account.transfer?.recipient?.toBase58?.() ?? 'recipient unavailable';
+    const asset = account.transfer?.nativeSol ? 'SOL' : short(account.target.toBase58());
+    return `SEND ${asset} · TO ${short(recipient)}`;
+  }
+  if ('buyApprovedToken' in account.action || 'sellApprovedToken' in account.action) {
+    return `TOKEN · ${short(account.target.toBase58())}`;
+  }
+  return 'NO FUNDS MOVE';
+}function actionName(action: Record<string, unknown>) { if ('buyApprovedToken' in action) return 'BUY PUMP.FUN TOKEN'; if ('sellApprovedToken' in action) return 'SELL PUMP.FUN TOKEN'; if ('transferToApprovedRecipient' in action) return 'SEND'; return 'HOLD'; }

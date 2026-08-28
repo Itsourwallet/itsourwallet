@@ -3,7 +3,7 @@ use anchor_lang::solana_program::program_pack::Pack;
 use anchor_lang::solana_program::{
     instruction::{AccountMeta, Instruction},
     program::invoke_signed,
-    pubkey,
+    pubkey, system_instruction,
 };
 use anchor_lang::system_program;
 use anchor_lang::system_program::{transfer, Transfer};
@@ -22,9 +22,14 @@ const BASE_PROPOSAL_FEE: u64 = 100_000_000;
 const BASE_VOTE_FEE: u64 = 10_000_000;
 const MAX_BPS: u64 = 10_000;
 const PUMP_PROGRAM_ID: Pubkey = pubkey!("6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P");
+const PUMP_AMM_PROGRAM_ID: Pubkey = pubkey!("pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA");
 const PUMP_SOL_QUOTE_MINT: Pubkey = pubkey!("So11111111111111111111111111111111111111112");
 const PUMP_BUY_V2_DISCRIMINATOR: [u8; 8] = [184, 23, 238, 97, 103, 197, 211, 61];
 const PUMP_SELL_V2_DISCRIMINATOR: [u8; 8] = [93, 246, 130, 60, 231, 233, 64, 178];
+const PUMP_AMM_BUY_DISCRIMINATOR: [u8; 8] = [102, 6, 61, 18, 1, 218, 235, 234];
+const PUMP_AMM_SELL_DISCRIMINATOR: [u8; 8] = [51, 230, 133, 164, 1, 127, 131, 173];
+const PUMP_AMM_BUY_ACCOUNT_COUNT: usize = 23;
+const PUMP_AMM_SELL_ACCOUNT_COUNT: usize = 21;
 const PUMP_BUY_V2_ACCOUNT_COUNT_WITHOUT_PROGRAM: usize = 26;
 const PUMP_SELL_V2_ACCOUNT_COUNT_WITHOUT_PROGRAM: usize = 25;
 #[program]
@@ -132,6 +137,92 @@ pub mod onchain {
         Ok(())
     }
 
+    pub fn create_transfer_proposal(
+        ctx: Context<CreateTransferProposal>,
+        args: ProposalArgs,
+        recipient: Pubkey,
+        native_sol: bool,
+    ) -> Result<()> {
+        let now = Clock::get()?.unix_timestamp;
+        require!(!ctx.accounts.treasury.paused, WallError::Paused);
+        require!(
+            ctx.accounts.round.status == RoundStatus::Open,
+            WallError::RoundClosed
+        );
+        require!(now < ctx.accounts.round.closes_at, WallError::RoundClosed);
+        require!(
+            args.expires_at > ctx.accounts.round.closes_at,
+            WallError::Expired
+        );
+        require!(
+            args.action == ActionKind::TransferToApprovedRecipient,
+            WallError::UnsupportedExecution
+        );
+        require!(recipient != Pubkey::default(), WallError::InvalidRecipient);
+        require!(
+            args.amount > 0 && args.maximum_amount == 0 && args.minimum_output == 0,
+            WallError::InvalidAmount
+        );
+        require!(
+            (native_sol && args.target == Pubkey::default())
+                || (!native_sol && args.target != Pubkey::default()),
+            WallError::InvalidMint
+        );
+        require!(
+            args.title.as_bytes().len() <= 64 && args.rationale.as_bytes().len() <= 192,
+            WallError::TextTooLong
+        );
+
+        transfer(
+            CpiContext::new(
+                ctx.accounts.system_program.to_account_info(),
+                Transfer {
+                    from: ctx.accounts.proposer.to_account_info(),
+                    to: ctx.accounts.vault.to_account_info(),
+                },
+            ),
+            dynamic_fee(
+                ctx.accounts.treasury.proposal_fee,
+                ctx.accounts.round.proposal_count,
+            )?,
+        )?;
+
+        let proposal = &mut ctx.accounts.proposal;
+        proposal.round = ctx.accounts.round.key();
+        proposal.id = ctx.accounts.round.proposal_count;
+        proposal.proposer = ctx.accounts.proposer.key();
+        proposal.action = args.action;
+        proposal.target = args.target;
+        proposal.amount = args.amount;
+        proposal.maximum_amount = 0;
+        proposal.minimum_output = 0;
+        proposal.max_slippage_bps = 0;
+        proposal.expires_at = args.expires_at;
+        proposal.title = args.title;
+        proposal.rationale = args.rationale;
+        proposal.created_at = now;
+        proposal.status = ProposalStatus::Voting;
+        proposal.bump = ctx.bumps.proposal;
+
+        let intent = &mut ctx.accounts.transfer_intent;
+        intent.proposal = proposal.key();
+        intent.recipient = recipient;
+        intent.native_sol = native_sol;
+        intent.bump = ctx.bumps.transfer_intent;
+
+        ctx.accounts.round.proposal_count = ctx
+            .accounts
+            .round
+            .proposal_count
+            .checked_add(1)
+            .ok_or(WallError::Overflow)?;
+        emit!(ProposalCreated {
+            round: ctx.accounts.round.number,
+            proposal: proposal.id,
+            proposer: proposal.proposer,
+        });
+        Ok(())
+    }
     pub fn buy_votes(ctx: Context<BuyVotes>, votes: u32) -> Result<()> {
         let now = Clock::get()?.unix_timestamp;
         require!(votes > 0, WallError::InvalidAmount);
@@ -512,6 +603,315 @@ pub mod onchain {
         Ok(())
     }
 
+    pub fn execute_pump_swap_trade<'info>(
+        ctx: Context<'_, '_, '_, 'info, ExecutePumpSwapTrade<'info>>,
+        instruction_data: Vec<u8>,
+    ) -> Result<()> {
+        let now = Clock::get()?.unix_timestamp;
+        require!(!ctx.accounts.treasury.paused, WallError::Paused);
+        require_winning_proposal(&ctx.accounts.round, &ctx.accounts.proposal, now)?;
+        require!(
+            ctx.accounts.pump_amm_program.key() == PUMP_AMM_PROGRAM_ID
+                && ctx.accounts.pump_amm_program.executable,
+            WallError::InvalidPumpProgram
+        );
+
+        let is_buy = ctx.accounts.proposal.action == ActionKind::BuyApprovedToken;
+        let minimum_count = if is_buy {
+            PUMP_AMM_BUY_ACCOUNT_COUNT
+        } else {
+            PUMP_AMM_SELL_ACCOUNT_COUNT
+        };
+        require!(
+            ctx.remaining_accounts.len() >= minimum_count
+                && ctx.remaining_accounts.len() <= minimum_count + 4,
+            WallError::InvalidPumpAccounts
+        );
+        validate_pump_swap_data(&ctx.accounts.proposal, &instruction_data)?;
+
+        let accounts = ctx.remaining_accounts;
+        require!(
+            accounts[1].key() == ctx.accounts.vault.key(),
+            WallError::InvalidPumpAccounts
+        );
+        require!(
+            accounts[3].key() == ctx.accounts.proposal.target,
+            WallError::InvalidMint
+        );
+        require!(
+            accounts[4].key() == PUMP_SOL_QUOTE_MINT,
+            WallError::UnsupportedQuoteMint
+        );
+        require!(
+            accounts[11].key() == token::ID || accounts[11].key() == token_2022::ID,
+            WallError::UnsupportedTokenProgram
+        );
+        require!(
+            accounts[12].key() == token::ID,
+            WallError::UnsupportedTokenProgram
+        );
+        require!(
+            accounts[13].key() == system_program::ID,
+            WallError::InvalidPumpAccounts
+        );
+        require!(
+            accounts[16].key() == PUMP_AMM_PROGRAM_ID,
+            WallError::InvalidPumpProgram
+        );
+        require!(
+            *accounts[0].owner == PUMP_AMM_PROGRAM_ID,
+            WallError::InvalidPumpAccounts
+        );
+        validate_token_program(&accounts[3], accounts[11].key)?;
+        validate_token_program(&accounts[4], accounts[12].key)?;
+
+        let (base_mint, base_owner, base_balance) =
+            token_account_details(&accounts[5], accounts[11].key)?;
+        require!(
+            base_mint == ctx.accounts.proposal.target && base_owner == ctx.accounts.vault.key(),
+            WallError::InvalidTokenAccount
+        );
+        let (quote_mint, quote_owner, _) = token_account_details(&accounts[6], accounts[12].key)?;
+        require!(
+            quote_mint == PUMP_SOL_QUOTE_MINT && quote_owner == ctx.accounts.vault.key(),
+            WallError::InvalidTokenAccount
+        );
+
+        let bump = [ctx.accounts.treasury.vault_bump];
+        let signer_seeds: &[&[u8]] = &[b"vault", &bump];
+        if is_buy {
+            charge_sol_outflow(
+                &mut ctx.accounts.treasury,
+                ctx.accounts.vault.to_account_info().lamports(),
+                ctx.accounts.proposal.maximum_amount,
+                false,
+                now,
+            )?;
+            let wrap_ix = system_instruction::transfer(
+                &ctx.accounts.vault.key(),
+                accounts[6].key,
+                ctx.accounts.proposal.maximum_amount,
+            );
+            invoke_signed(
+                &wrap_ix,
+                &[
+                    ctx.accounts.vault.to_account_info(),
+                    accounts[6].clone(),
+                    accounts[13].clone(),
+                ],
+                &[signer_seeds],
+            )?;
+            let sync_ix = anchor_spl::token::spl_token::instruction::sync_native(
+                &token::ID,
+                accounts[6].key,
+            )?;
+            invoke_signed(
+                &sync_ix,
+                &[accounts[6].clone(), accounts[12].clone()],
+                &[signer_seeds],
+            )?;
+        } else {
+            let cap = base_balance
+                .checked_mul(ctx.accounts.treasury.config.universal_action_limit_bps as u64)
+                .ok_or(WallError::Overflow)?
+                / MAX_BPS;
+            require!(
+                ctx.accounts.proposal.amount <= cap,
+                WallError::ActionLimitExceeded
+            );
+        }
+
+        let metas: Vec<AccountMeta> = accounts
+            .iter()
+            .enumerate()
+            .map(|(index, account)| {
+                if account.is_writable {
+                    AccountMeta::new(account.key(), index == 1)
+                } else {
+                    AccountMeta::new_readonly(account.key(), index == 1)
+                }
+            })
+            .collect();
+        let instruction = Instruction {
+            program_id: PUMP_AMM_PROGRAM_ID,
+            accounts: metas,
+            data: instruction_data,
+        };
+        let mut infos = accounts.to_vec();
+        infos.push(ctx.accounts.pump_amm_program.to_account_info());
+        invoke_signed(&instruction, &infos, &[signer_seeds])?;
+
+        let close_ix = anchor_spl::token::spl_token::instruction::close_account(
+            &token::ID,
+            accounts[6].key,
+            &ctx.accounts.vault.key(),
+            &ctx.accounts.vault.key(),
+            &[],
+        )?;
+        invoke_signed(
+            &close_ix,
+            &[
+                accounts[6].clone(),
+                ctx.accounts.vault.to_account_info(),
+                ctx.accounts.vault.to_account_info(),
+                accounts[12].clone(),
+            ],
+            &[signer_seeds],
+        )?;
+
+        let proposal = &mut ctx.accounts.proposal;
+        proposal.status = ProposalStatus::Executed;
+        proposal.executed_at = now;
+        proposal.execution_amount = if is_buy {
+            proposal.maximum_amount
+        } else {
+            proposal.amount
+        };
+        emit!(ProposalExecuted {
+            proposal: proposal.key(),
+            amount: proposal.execution_amount
+        });
+        Ok(())
+    }
+
+    pub fn execute_sol_transfer(ctx: Context<ExecuteSolTransfer>) -> Result<()> {
+        let now = Clock::get()?.unix_timestamp;
+        require!(!ctx.accounts.treasury.paused, WallError::Paused);
+        require_winning_proposal(&ctx.accounts.round, &ctx.accounts.proposal, now)?;
+        require!(
+            ctx.accounts.proposal.action == ActionKind::TransferToApprovedRecipient,
+            WallError::UnsupportedExecution
+        );
+        require!(
+            ctx.accounts.transfer_intent.native_sol,
+            WallError::UnsupportedExecution
+        );
+        require!(
+            ctx.accounts.proposal.target == Pubkey::default(),
+            WallError::InvalidMint
+        );
+        require!(
+            ctx.accounts.recipient.key() == ctx.accounts.transfer_intent.recipient,
+            WallError::InvalidRecipient
+        );
+
+        charge_sol_outflow(
+            &mut ctx.accounts.treasury,
+            ctx.accounts.vault.to_account_info().lamports(),
+            ctx.accounts.proposal.amount,
+            true,
+            now,
+        )?;
+        let bump = [ctx.accounts.treasury.vault_bump];
+        let signer_seeds: &[&[u8]] = &[b"vault", &bump];
+        let ix = system_instruction::transfer(
+            &ctx.accounts.vault.key(),
+            &ctx.accounts.recipient.key(),
+            ctx.accounts.proposal.amount,
+        );
+        invoke_signed(
+            &ix,
+            &[
+                ctx.accounts.vault.to_account_info(),
+                ctx.accounts.recipient.to_account_info(),
+                ctx.accounts.system_program.to_account_info(),
+            ],
+            &[signer_seeds],
+        )?;
+        let amount = ctx.accounts.proposal.amount;
+        mark_executed(&mut ctx.accounts.proposal, now, amount)
+    }
+
+    pub fn execute_token_transfer(ctx: Context<ExecuteTokenTransfer>) -> Result<()> {
+        let now = Clock::get()?.unix_timestamp;
+        require!(!ctx.accounts.treasury.paused, WallError::Paused);
+        require_winning_proposal(&ctx.accounts.round, &ctx.accounts.proposal, now)?;
+        require!(
+            ctx.accounts.proposal.action == ActionKind::TransferToApprovedRecipient,
+            WallError::UnsupportedExecution
+        );
+        require!(
+            !ctx.accounts.transfer_intent.native_sol,
+            WallError::UnsupportedExecution
+        );
+        require!(
+            ctx.accounts.mint.key() == ctx.accounts.proposal.target,
+            WallError::InvalidMint
+        );
+        validate_token_program(
+            &ctx.accounts.mint.to_account_info(),
+            &ctx.accounts.token_program.key(),
+        )?;
+
+        let (source_mint, source_owner, source_balance) = token_account_details(
+            &ctx.accounts.source_token_account.to_account_info(),
+            &ctx.accounts.token_program.key(),
+        )?;
+        let (destination_mint, destination_owner, _) = token_account_details(
+            &ctx.accounts.destination_token_account.to_account_info(),
+            &ctx.accounts.token_program.key(),
+        )?;
+        require!(
+            source_mint == ctx.accounts.mint.key() && source_owner == ctx.accounts.vault.key(),
+            WallError::InvalidTokenAccount
+        );
+        require!(
+            destination_mint == ctx.accounts.mint.key()
+                && destination_owner == ctx.accounts.transfer_intent.recipient,
+            WallError::InvalidRecipient
+        );
+        let cap = source_balance
+            .checked_mul(ctx.accounts.treasury.config.external_transfer_limit_bps as u64)
+            .ok_or(WallError::Overflow)?
+            / MAX_BPS;
+        require!(
+            ctx.accounts.proposal.amount <= cap,
+            WallError::ActionLimitExceeded
+        );
+
+        let decimals = mint_decimals(
+            &ctx.accounts.mint.to_account_info(),
+            &ctx.accounts.token_program.key(),
+        )?;
+        let ix = if ctx.accounts.token_program.key() == token::ID {
+            anchor_spl::token::spl_token::instruction::transfer_checked(
+                &token::ID,
+                &ctx.accounts.source_token_account.key(),
+                &ctx.accounts.mint.key(),
+                &ctx.accounts.destination_token_account.key(),
+                &ctx.accounts.vault.key(),
+                &[],
+                ctx.accounts.proposal.amount,
+                decimals,
+            )?
+        } else {
+            anchor_spl::token_2022::spl_token_2022::instruction::transfer_checked(
+                &token_2022::ID,
+                &ctx.accounts.source_token_account.key(),
+                &ctx.accounts.mint.key(),
+                &ctx.accounts.destination_token_account.key(),
+                &ctx.accounts.vault.key(),
+                &[],
+                ctx.accounts.proposal.amount,
+                decimals,
+            )?
+        };
+        let bump = [ctx.accounts.treasury.vault_bump];
+        let signer_seeds: &[&[u8]] = &[b"vault", &bump];
+        invoke_signed(
+            &ix,
+            &[
+                ctx.accounts.source_token_account.to_account_info(),
+                ctx.accounts.mint.to_account_info(),
+                ctx.accounts.destination_token_account.to_account_info(),
+                ctx.accounts.vault.to_account_info(),
+                ctx.accounts.token_program.to_account_info(),
+            ],
+            &[signer_seeds],
+        )?;
+        let amount = ctx.accounts.proposal.amount;
+        mark_executed(&mut ctx.accounts.proposal, now, amount)
+    }
     pub fn execute_hold(ctx: Context<ExecuteHold>) -> Result<()> {
         require!(
             ctx.accounts.round.status == RoundStatus::Settled,
@@ -548,6 +948,137 @@ pub mod onchain {
     }
 }
 
+fn require_winning_proposal(
+    round: &Account<Round>,
+    proposal: &Account<Proposal>,
+    now: i64,
+) -> Result<()> {
+    require!(
+        round.status == RoundStatus::Settled,
+        WallError::RoundStillOpen
+    );
+    require!(
+        round.winning_proposal == Some(proposal.id),
+        WallError::NotWinningProposal
+    );
+    require!(
+        proposal.status == ProposalStatus::Won,
+        WallError::ProposalUnavailable
+    );
+    require!(now <= proposal.expires_at, WallError::Expired);
+    Ok(())
+}
+
+fn charge_sol_outflow(
+    treasury: &mut Account<Treasury>,
+    vault_lamports: u64,
+    amount: u64,
+    external_transfer: bool,
+    now: i64,
+) -> Result<()> {
+    require!(amount > 0, WallError::InvalidAmount);
+    let action_bps = if external_transfer {
+        treasury.config.external_transfer_limit_bps
+    } else {
+        treasury.config.universal_action_limit_bps
+    } as u64;
+    let action_cap = vault_lamports
+        .checked_mul(action_bps)
+        .ok_or(WallError::Overflow)?
+        / MAX_BPS;
+    require!(amount <= action_cap, WallError::ActionLimitExceeded);
+    if now.saturating_sub(treasury.rolling_window_started_at) >= ROLLING_WINDOW_SECONDS {
+        treasury.rolling_window_started_at = now;
+        treasury.rolling_spent_lamports = 0;
+    }
+    let rolling_cap = vault_lamports
+        .checked_mul(treasury.config.rolling_transfer_limit_bps as u64)
+        .ok_or(WallError::Overflow)?
+        / MAX_BPS;
+    let new_total = treasury
+        .rolling_spent_lamports
+        .checked_add(amount)
+        .ok_or(WallError::Overflow)?;
+    require!(new_total <= rolling_cap, WallError::RollingLimitExceeded);
+    treasury.rolling_spent_lamports = new_total;
+    Ok(())
+}
+
+fn validate_pump_swap_data(proposal: &Account<Proposal>, data: &[u8]) -> Result<()> {
+    match proposal.action {
+        ActionKind::BuyApprovedToken => {
+            require!(
+                data.len() == 25 && data[..8] == PUMP_AMM_BUY_DISCRIMINATOR && data[24] == 0,
+                WallError::InvalidPumpInstruction
+            );
+            let base_out = u64::from_le_bytes(
+                data[8..16]
+                    .try_into()
+                    .map_err(|_| WallError::InvalidPumpInstruction)?,
+            );
+            let max_quote = u64::from_le_bytes(
+                data[16..24]
+                    .try_into()
+                    .map_err(|_| WallError::InvalidPumpInstruction)?,
+            );
+            require!(
+                base_out == proposal.amount && max_quote == proposal.maximum_amount,
+                WallError::InvalidPumpInstruction
+            );
+        }
+        ActionKind::SellApprovedToken => {
+            require!(
+                data.len() == 24 && data[..8] == PUMP_AMM_SELL_DISCRIMINATOR,
+                WallError::InvalidPumpInstruction
+            );
+            let base_in = u64::from_le_bytes(
+                data[8..16]
+                    .try_into()
+                    .map_err(|_| WallError::InvalidPumpInstruction)?,
+            );
+            let min_quote = u64::from_le_bytes(
+                data[16..24]
+                    .try_into()
+                    .map_err(|_| WallError::InvalidPumpInstruction)?,
+            );
+            require!(
+                base_in == proposal.amount && min_quote == proposal.minimum_output,
+                WallError::InvalidPumpInstruction
+            );
+        }
+        _ => return err!(WallError::UnsupportedExecution),
+    }
+    Ok(())
+}
+
+fn mint_decimals(mint: &AccountInfo, token_program: &Pubkey) -> Result<u8> {
+    require!(*mint.owner == *token_program, WallError::InvalidMintOwner);
+    let data = mint.try_borrow_data()?;
+    if *token_program == token::ID {
+        Ok(anchor_spl::token::spl_token::state::Mint::unpack(&data)?.decimals)
+    } else if *token_program == token_2022::ID {
+        Ok(
+            StateWithExtensions::<anchor_spl::token_2022::spl_token_2022::state::Mint>::unpack(
+                &data,
+            )?
+            .base
+            .decimals,
+        )
+    } else {
+        err!(WallError::UnsupportedTokenProgram)
+    }
+}
+
+fn mark_executed(proposal: &mut Account<Proposal>, now: i64, amount: u64) -> Result<()> {
+    proposal.status = ProposalStatus::Executed;
+    proposal.executed_at = now;
+    proposal.execution_amount = amount;
+    emit!(ProposalExecuted {
+        proposal: proposal.key(),
+        amount
+    });
+    Ok(())
+}
 fn dynamic_fee(base: u64, demand: u64) -> Result<u64> {
     let steps = demand.min(10);
     let surcharge = base.checked_mul(steps).ok_or(WallError::Overflow)? / 20;
@@ -651,6 +1182,24 @@ pub struct CreateProposal<'info> {
     pub vault: UncheckedAccount<'info>,
     #[account(init, payer=proposer, space=8+Proposal::INIT_SPACE, seeds=[b"proposal", round.key().as_ref(), &round.proposal_count.to_le_bytes()], bump)]
     pub proposal: Account<'info, Proposal>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct CreateTransferProposal<'info> {
+    #[account(mut)]
+    pub proposer: Signer<'info>,
+    #[account(mut, seeds=[b"treasury"], bump=treasury.bump)]
+    pub treasury: Account<'info, Treasury>,
+    #[account(mut, has_one=treasury)]
+    pub round: Account<'info, Round>,
+    /// CHECK: system-owned SOL vault PDA; address is constrained.
+    #[account(mut, seeds=[b"vault"], bump=treasury.vault_bump, owner=system_program::ID)]
+    pub vault: UncheckedAccount<'info>,
+    #[account(init, payer=proposer, space=8+Proposal::INIT_SPACE, seeds=[b"proposal", round.key().as_ref(), &round.proposal_count.to_le_bytes()], bump)]
+    pub proposal: Account<'info, Proposal>,
+    #[account(init, payer=proposer, space=8+TransferIntent::INIT_SPACE, seeds=[b"transfer-intent", proposal.key().as_ref()], bump)]
+    pub transfer_intent: Account<'info, TransferIntent>,
     pub system_program: Program<'info, System>,
 }
 
@@ -760,6 +1309,68 @@ pub struct ApplyAuthorityTransfer<'info> {
 }
 
 #[derive(Accounts)]
+pub struct ExecutePumpSwapTrade<'info> {
+    pub keeper: Signer<'info>,
+    #[account(mut, seeds=[b"treasury"], bump=treasury.bump)]
+    pub treasury: Account<'info, Treasury>,
+    /// CHECK: system-owned PDA; address and owner are constrained.
+    #[account(mut, seeds=[b"vault"], bump=treasury.vault_bump, owner=system_program::ID)]
+    pub vault: UncheckedAccount<'info>,
+    #[account(has_one=treasury)]
+    pub round: Account<'info, Round>,
+    #[account(mut, has_one=round)]
+    pub proposal: Account<'info, Proposal>,
+    /// CHECK: fixed to PumpSwap mainnet program by handler.
+    pub pump_amm_program: UncheckedAccount<'info>,
+}
+
+#[derive(Accounts)]
+pub struct ExecuteSolTransfer<'info> {
+    pub keeper: Signer<'info>,
+    #[account(mut, seeds=[b"treasury"], bump=treasury.bump)]
+    pub treasury: Account<'info, Treasury>,
+    /// CHECK: system-owned PDA; address and owner are constrained.
+    #[account(mut, seeds=[b"vault"], bump=treasury.vault_bump, owner=system_program::ID)]
+    pub vault: UncheckedAccount<'info>,
+    #[account(has_one=treasury)]
+    pub round: Account<'info, Round>,
+    #[account(mut, has_one=round)]
+    pub proposal: Account<'info, Proposal>,
+    #[account(has_one=proposal, seeds=[b"transfer-intent", proposal.key().as_ref()], bump=transfer_intent.bump)]
+    pub transfer_intent: Account<'info, TransferIntent>,
+    /// CHECK: address is bound by transfer_intent; any Solana account may receive SOL.
+    #[account(mut)]
+    pub recipient: UncheckedAccount<'info>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct ExecuteTokenTransfer<'info> {
+    pub keeper: Signer<'info>,
+    #[account(seeds=[b"treasury"], bump=treasury.bump)]
+    pub treasury: Account<'info, Treasury>,
+    /// CHECK: PDA address is constrained and used only as token authority.
+    #[account(seeds=[b"vault"], bump=treasury.vault_bump, owner=system_program::ID)]
+    pub vault: UncheckedAccount<'info>,
+    #[account(has_one=treasury)]
+    pub round: Account<'info, Round>,
+    #[account(mut, has_one=round)]
+    pub proposal: Account<'info, Proposal>,
+    #[account(has_one=proposal, seeds=[b"transfer-intent", proposal.key().as_ref()], bump=transfer_intent.bump)]
+    pub transfer_intent: Account<'info, TransferIntent>,
+    /// CHECK: mint owner and data are validated for legacy Token or Token-2022.
+    pub mint: UncheckedAccount<'info>,
+    /// CHECK: parsed and validated against mint and vault authority.
+    #[account(mut)]
+    pub source_token_account: UncheckedAccount<'info>,
+    /// CHECK: parsed and validated against mint and bound recipient.
+    #[account(mut)]
+    pub destination_token_account: UncheckedAccount<'info>,
+    /// CHECK: fixed to legacy Token or Token-2022 by handler.
+    pub token_program: UncheckedAccount<'info>,
+}
+
+#[derive(Accounts)]
 pub struct ExecuteHold<'info> {
     pub keeper: Signer<'info>,
     #[account(seeds=[b"treasury"], bump=treasury.bump)]
@@ -796,6 +1407,15 @@ pub struct MintApproval {
     pub enabled: bool,
     pub pending_enabled: bool,
     pub execute_after: i64,
+    pub bump: u8,
+}
+
+#[account]
+#[derive(InitSpace)]
+pub struct TransferIntent {
+    pub proposal: Pubkey,
+    pub recipient: Pubkey,
+    pub native_sol: bool,
     pub bump: u8,
 }
 
@@ -1039,6 +1659,10 @@ pub enum WallError {
     UnsupportedExecution,
     #[msg("Invalid treasury token account")]
     InvalidTokenAccount,
+    #[msg("Invalid transfer recipient")]
+    InvalidRecipient,
+    #[msg("Invalid PumpSwap instruction data")]
+    InvalidPumpInstruction,
     #[msg("Rolling 24-hour outflow limit exceeded")]
     RollingLimitExceeded,
 }

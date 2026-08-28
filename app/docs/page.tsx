@@ -1,4 +1,5 @@
 import type { Metadata } from 'next';
+import Link from 'next/link';
 
 const PROGRAM = 'G2EYJC2fg2eH5sGw1Fr3Sk4bXqPSvQ4NVcX1BmGFzVA8';
 const PROGRAM_DATA = 'J4q4HrGWZjThw98sMb38jSLXNHhnRMoHZMMmKGrPm1wJ';
@@ -15,8 +16,8 @@ export const metadata: Metadata = {
 export default function DocsPage() {
   return <main className="docs-page">
     <header className="docs-nav">
-      <a className="brand" href="/"><img src="/public-wallet-logo.png" alt="" width="40" height="40"/><span>IT&apos;S OUR WALLET</span></a>
-      <nav><a href="#proof">PROOF</a><a href="#how">HOW IT WORKS</a><a href="#trust">TRUST</a><a href="/">OPEN APP</a></nav>
+      <Link className="brand" href="/"><img src="/public-wallet-logo.png" alt="" width="40" height="40"/><span>IT&apos;S OUR WALLET</span></Link>
+      <nav><a href="#proof">PROOF</a><a href="#how">HOW IT WORKS</a><a href="#trust">TRUST</a><Link href="/">OPEN APP</Link></nav>
     </header>
 
     <section className="docs-hero">
@@ -82,11 +83,12 @@ export default function DocsPage() {
         <section id="trading">
           <Label n="04" text="PUMP.FUN EXECUTION"/>
           <h2>What the wallet can trade</h2>
-          <p>A proposal can target any valid, active Pump.fun bonding-curve mint paired with native SOL. The app validates the mint, token program and curve before proposal payment.</p>
-          <div className="callout"><b>ACTIVE CURVES ONLY</b><p>Graduated tokens use PumpSwap/AMM and are rejected by the current bonding-curve route.</p></div>
+          <p>A proposal can target any valid Pump.fun token paired with native SOL. Active tokens use the bonding curve; graduated tokens use their canonical PumpSwap pool.</p>
+          <div className="callout"><b>ONE PITCH, BOTH ROUTES</b><p>The app detects whether the token is still on its Pump.fun curve or has graduated to PumpSwap, then builds the matching transaction.</p></div>
           <h3>Buying</h3><p>The proposer enters a maximum SOL budget. The app reads the live curve and fee state, estimates output, applies 5% protection and records integer amounts.</p>
           <h3>Selling</h3><p>The proposer enters a normal token quantity. Mint decimals are converted automatically. The program can only sell tokens owned by the vault.</p>
-          <h3>Atomic execution</h3><p>The Pump.fun call happens inside one Solana transaction. If validation or Pump.fun fails, trade funds do not partially move.</p>
+          <h3>Sending</h3><p>A proposal can send SOL or a treasury-owned legacy/Token-2022 token to any valid Solana wallet. The recipient and asset are bound on-chain before voting.</p>
+          <h3>Atomic execution</h3><p>The Pump.fun or PumpSwap call happens inside one Solana transaction. If validation or the venue fails, trade funds do not partially move.</p>
         </section>
 
         <section id="security">
@@ -96,7 +98,7 @@ export default function DocsPage() {
             <Fact title="SINGLE ACTION" value="25% OF BALANCE"/>
             <Fact title="ROLLING SPEND" value="25% PER 24 HOURS"/>
             <Fact title="MAX SLIPPAGE" value="5%"/>
-            <Fact title="EXTERNAL TRANSFER" value="5%"/>
+            <Fact title="SEND LIMIT" value="5% PER ACTION"/>
             <Fact title="ORACLE FRESHNESS" value="60 SECONDS"/>
             <Fact title="EXECUTION WINDOW" value="10 MIN AFTER CLOSE"/>
           </div>
@@ -127,7 +129,7 @@ export default function DocsPage() {
         </section>
       </article>
     </div>
-    <footer><b>IT&apos;S OUR WALLET</b><a href="/">BACK TO THE MACHINE ↗</a></footer>
+    <footer><b>IT&apos;S OUR WALLET</b><Link href="/">BACK TO THE MACHINE ↗</Link></footer>
   </main>;
 }
 
