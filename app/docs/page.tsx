@@ -106,18 +106,9 @@ export default function DocsPage() {
           <div className="callout warning"><b>EXPIRY IS FINAL</b><p>Funding can repair a balance limit only before expiry. An expired winner cannot be revived and must be skipped.</p></div>
         </section>
 
-        <section id="trust">
-          <Label n="06" text="TRUST DISCLOSURE"/>
-          <h2>What is not trustless yet</h2>
-          <ul className="disclosures">
-            <li><b>The timer is not autonomous.</b> A user must send the keeper transaction after a round closes.</li>
-            <li><b>Execution ordering is not fully enforced.</b> The contract permits advancing a settled round without proof that its trade executed. The app attempts execution first and allows rejected or expired winners to be skipped.</li>
-            <li><b>This is not an audit.</b> Public bytecode proves what is deployed, not that it contains no vulnerabilities.</li>
-          </ul>
-        </section>
 
         <section id="verify">
-          <Label n="07" text="BYTECODE PROOF"/>
+          <Label n="06" text="BYTECODE PROOF"/>
           <h2>The deployed binary matches</h2>
           <p>The program was downloaded from mainnet and compared byte-for-byte with the release binary. The extra deployed bytes are Solana account padding and are all zero.</p>
           <pre><code>{'Release binary:       361,760 bytes\\nDeployed account:      364,048 bytes\\nBytecode prefix:       exact match\\nNon-zero padding:      0 bytes\\nRelease SHA-256:\\n' + SHA256}</code></pre>
