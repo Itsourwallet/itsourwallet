@@ -1,7 +1,7 @@
 /* eslint-disable @typescript-eslint/no-explicit-any -- Anchor account namespaces are generated at runtime from the committed IDL. */
 'use client';
 
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { AnchorProvider, BN, Idl, Program } from '@coral-xyz/anchor';
 import { useAnchorWallet, useConnection } from '@solana/wallet-adapter-react';
 import { PublicKey, SystemProgram } from '@solana/web3.js';
@@ -25,6 +25,7 @@ export function WallActions() {
   const { connection } = useConnection();
   const wallet = useAnchorWallet();
   const [proposals, setProposals] = useState<ProposalView[]>([]);
+  const refreshSequence = useRef(0);
   const [round, setRound] = useState<PublicKey>();
   const [roundState, setRoundState] = useState<any>();
   const [observedAt, setObservedAt] = useState(0);
@@ -117,7 +118,8 @@ export function WallActions() {
   const refreshPageBalances = () => window.dispatchEvent(new Event('public-wallet:refresh'));
 
   const refresh = useCallback(async () => {
-    setObservedAt(Math.floor(Date.now() / 1000));
+    const sequence = ++refreshSequence.current;
+    const snapshotAt = Math.floor(Date.now() / 1000);
     if (!program) { setProposals([]); setRoundState(undefined); setMaxBuySol(undefined); setKeeperHasGas(undefined); return; }
     try {
       const [treasury] = PublicKey.findProgramAddressSync([new TextEncoder().encode('treasury')], program.programId);
@@ -134,8 +136,7 @@ export function WallActions() {
       const [currentRound] = PublicKey.findProgramAddressSync([
         new TextEncoder().encode('round'), treasury.toBuffer(), Uint8Array.from(number.toArray('le', 8)),
       ], program.programId);
-      setRound(currentRound);
-      setRoundState(await program.account.round.fetch(currentRound));
+      const liveRoundState = await program.account.round.fetch(currentRound);
       const rows = await program.account.proposal.all([{ memcmp: { offset: 8, bytes: currentRound.toBase58() } }]);
       const hydrated = await Promise.all(rows.map(async (row: ProposalView) => {
         if (!('transferToApprovedRecipient' in row.account.action)) return row;
@@ -146,9 +147,13 @@ export function WallActions() {
         const transfer = await program.account.transferIntent.fetchNullable(intent);
         return { ...row, account: { ...row.account, transfer } };
       }));
+      if (sequence !== refreshSequence.current) return;
+      setObservedAt(snapshotAt);
+      setRound(currentRound);
+      setRoundState(liveRoundState);
       setProposals(hydrated.sort((a: ProposalView, b: ProposalView) => Number(b.account.votes.sub(a.account.votes))));
     } catch (error) {
-      setNotice(readError(error));
+      if (sequence === refreshSequence.current) setNotice(readError(error));
     }
   }, [program, connection]);
 
