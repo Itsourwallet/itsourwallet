@@ -1013,7 +1013,24 @@
           "address": "11111111111111111111111111111111"
         }
       ],
-      "args": []
+      "args": [
+        {
+          "name": "args",
+          "type": {
+            "defined": {
+              "name": "ProposalArgs"
+            }
+          }
+        },
+        {
+          "name": "recipient",
+          "type": "pubkey"
+        },
+        {
+          "name": "native_sol",
+          "type": "bool"
+        }
+      ]
     },
     {
       "name": "execute_pump_swap_trade",
@@ -1051,7 +1068,14 @@
           "name": "pump_amm_program"
         }
       ],
-      "args": []
+      "args": [
+        {
+          "name": "instruction_data",
+          "type": {
+            "vec": "u8"
+          }
+        }
+      ]
     },
     {
       "name": "execute_sol_transfer",

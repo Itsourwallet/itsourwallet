@@ -5,6 +5,7 @@ import { useCallback, useEffect, useMemo, useState } from 'react';
 import { AnchorProvider, BN, Idl, Program } from '@coral-xyz/anchor';
 import { useAnchorWallet, useConnection } from '@solana/wallet-adapter-react';
 import { PublicKey, SystemProgram } from '@solana/web3.js';
+import { TOKEN_2022_PROGRAM_ID, TOKEN_PROGRAM_ID, getAssociatedTokenAddressSync } from '@solana/spl-token';
 import idl from './onchain-idl.json';
 import {
   executePumpWinner,
@@ -26,6 +27,7 @@ export function WallActions() {
   const [busy, setBusy] = useState('');
   const [notice, setNotice] = useState('');
   const [maxBuySol, setMaxBuySol] = useState<number>();
+  const [sendMaximum, setSendMaximum] = useState<{ display: string; baseUnits: string }>();
   const [canSkipWinner, setCanSkipWinner] = useState(false);
   const [open, setOpen] = useState(false);
   const [title, setTitle] = useState('');
@@ -84,6 +86,21 @@ export function WallActions() {
     return () => { window.clearTimeout(initial); window.clearInterval(timer); };
   }, [refresh]);
 
+  useEffect(() => {
+    let cancelled = false;
+    if (!open || !program || (action !== 'sendSol' && action !== 'sendToken')) {
+      setSendMaximum(undefined);
+      return;
+    }
+    const timer = window.setTimeout(() => {
+      void fetchSendMaximum(connection, program, action, mint).then(value => {
+        if (!cancelled) setSendMaximum(value);
+      }).catch(() => {
+        if (!cancelled) setSendMaximum(undefined);
+      });
+    }, action === 'sendToken' ? 350 : 0);
+    return () => { cancelled = true; window.clearTimeout(timer); };
+  }, [action, connection, mint, open, program]);
   const submit = async () => {
     if (!program || !wallet) { setNotice('Connect a wallet first.'); return; }
     if (roundState && (!('open' in roundState.status) || Math.floor(Date.now() / 1000) >= Number(roundState.closesAt.toString()))) {
@@ -131,7 +148,12 @@ export function WallActions() {
           : action === 'sendSol'
             ? solToLamports(amount)
             : await normalTokenAmountToBaseUnits(connection, target, amount);
-      const actionValue = action === 'hold'
+      if (isSend) {
+        const maximum = await fetchSendMaximum(connection, program, action, mint);
+        if (rawAmount.gt(new BN(maximum.baseUnits))) {
+          throw new Error(`The most this proposal can send right now is ${maximum.display} ${action === 'sendSol' ? 'SOL' : 'tokens'}.`);
+        }
+      }      const actionValue = action === 'hold'
         ? { hold: {} }
         : action === 'buy'
           ? { buyApprovedToken: {} }
@@ -293,7 +315,10 @@ export function WallActions() {
         <label>THE PITCH<textarea maxLength={192} value={rationale} onChange={event => setRationale(event.target.value)} placeholder="Why should strangers approve this?"/></label>
         {(action === 'buy' || action === 'sell' || action === 'sendToken') && <label>TOKEN MINT<input value={mint} onChange={event => setMint(event.target.value)} placeholder="Solana mint address"/></label>}
         {(action === 'sendSol' || action === 'sendToken') && <label>RECIPIENT WALLET<input value={recipient} onChange={event => setRecipient(event.target.value)} placeholder="Solana wallet address"/></label>}
-        {(action === 'sell' || action === 'sendSol' || action === 'sendToken') && <label>{action === 'sell' ? 'TOKENS TO SELL' : action === 'sendSol' ? 'SOL TO SEND' : 'TOKENS TO SEND'}<input inputMode="decimal" value={amount} onChange={event => setAmount(event.target.value)} placeholder={action === 'sendSol' ? '0.01' : '100'}/></label>}
+        {(action === 'sell' || action === 'sendSol' || action === 'sendToken') && <label>{action === 'sell' ? 'TOKENS TO SELL' : action === 'sendSol' ? 'SOL TO SEND' : 'TOKENS TO SEND'}
+          <span className="amount-row"><input inputMode="decimal" value={amount} onChange={event => setAmount(event.target.value)} placeholder={action === 'sendSol' ? '0.01' : '100'}/>{(action === 'sendSol' || action === 'sendToken') && <button className="max-button" type="button" disabled={!sendMaximum} onClick={() => sendMaximum && setAmount(sendMaximum.display)}>MAX</button>}</span>
+          {(action === 'sendSol' || action === 'sendToken') && <small className="send-max">MAXIMUM NOW · {sendMaximum ? `${sendMaximum.display} ${action === 'sendSol' ? 'SOL' : 'TOKENS'} · 5% OF TREASURY BALANCE` : action === 'sendToken' && !mint.trim() ? 'ENTER A TOKEN MINT' : 'CALCULATING…'}</small>}
+        </label>}
         {(action === 'buy' || action === 'sell') && <label>{action === 'buy' ? 'MAX SOL TO SPEND' + (maxBuySol === undefined ? '' : ' · CURRENT LIMIT ' + maxBuySol.toFixed(4)) : 'MIN SOL TO RECEIVE'}<input inputMode="decimal" value={limit} onChange={event => setLimit(event.target.value)} placeholder="0.05"/></label>}
         <div><button type="button" className="secondary" onClick={() => setOpen(false)}>NEVER MIND</button><button type="button" className="pitch-button" disabled={Boolean(busy)} onClick={() => void submit()}>{busy === 'proposal' ? 'ASKING WALLET…' : 'PUT IT ON-CHAIN'}</button></div>
       </div>)}
@@ -301,6 +326,35 @@ export function WallActions() {
   </div>;
 }
 
+async function fetchSendMaximum(connection: any, program: any, action: 'sendSol' | 'sendToken', mintValue: string) {
+  const [treasury] = PublicKey.findProgramAddressSync([new TextEncoder().encode('treasury')], program.programId);
+  const [vault] = PublicKey.findProgramAddressSync([new TextEncoder().encode('vault')], program.programId);
+  const state = await program.account.treasury.fetch(treasury);
+  const config = state.config as any;
+  const bps = BigInt(config.externalTransferLimitBps ?? config.external_transfer_limit_bps);
+  if (action === 'sendSol') {
+    const balance = BigInt(await connection.getBalance(vault, 'confirmed'));
+    const cap = balance * bps / BigInt(10_000);
+    return { display: formatBaseUnits(cap, 9), baseUnits: cap.toString() };
+  }
+  const mint = new PublicKey(mintValue.trim());
+  const mintInfo = await connection.getAccountInfo(mint, 'confirmed');
+  if (!mintInfo || (!mintInfo.owner.equals(TOKEN_PROGRAM_ID) && !mintInfo.owner.equals(TOKEN_2022_PROGRAM_ID))) {
+    throw new Error('This token mint is not supported.');
+  }
+  const source = getAssociatedTokenAddressSync(mint, vault, true, mintInfo.owner);
+  const balance = await connection.getTokenAccountBalance(source, 'confirmed');
+  const cap = BigInt(balance.value.amount) * bps / BigInt(10_000);
+  return { display: formatBaseUnits(cap, balance.value.decimals), baseUnits: cap.toString() };
+}
+
+function formatBaseUnits(value: bigint, decimals: number) {
+  if (decimals === 0) return value.toString();
+  const padded = value.toString().padStart(decimals + 1, '0');
+  const whole = padded.slice(0, -decimals);
+  const fraction = padded.slice(-decimals).replace(/0+$/, '');
+  return fraction ? `${whole}.${fraction}` : whole;
+}
 function calculateBuyCapLamports(treasuryState: any, vaultLamports: number) {
   const actionBps = Number(treasuryState.config.universalActionLimitBps);
   const actionCap = Math.floor(vaultLamports * actionBps / 10_000);
