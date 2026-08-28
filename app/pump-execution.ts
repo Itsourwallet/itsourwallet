@@ -6,6 +6,7 @@ import {
   PUMP_SDK,
   bondingCurvePda,
   getBuyTokenAmountFromSolAmount,
+  getSellSolAmountFromTokenAmount,
 } from '@pump-fun/pump-sdk';
 import {
   OnlinePumpAmmSdk,
@@ -13,6 +14,7 @@ import {
   PUMP_AMM_SDK,
   buyQuoteInput,
   canonicalPumpPoolPda,
+  sellBaseInput,
 } from '@pump-fun/pump-swap-sdk';
 import {
   NATIVE_MINT,
@@ -98,6 +100,22 @@ export async function quotePumpBuyAmount(
   });
   const protectedAmount = quote.base.muln(10_000 - slippageBps).divn(10_000);
   if (protectedAmount.isZero()) throw new Error('The SOL budget is too small for this PumpSwap pool.');
+  return protectedAmount;
+}
+export async function quotePumpSellMinimum(connection: Connection, mint: PublicKey, tokenAmount: BN, slippageBps = 500) {
+  const token = await validatePumpToken(connection, mint);
+  let expected: BN;
+  if (token.route === 'bonding') {
+    const onlineSdk = new OnlinePumpSdk(connection);
+    const [global, feeConfig] = await Promise.all([onlineSdk.fetchGlobal(), onlineSdk.fetchFeeConfig()]);
+    expected = getSellSolAmountFromTokenAmount({ global, feeConfig, mintSupply: new BN(token.mintState.supply.toString()), bondingCurve: token.curve, amount: tokenAmount });
+  } else {
+    const onlineAmm = new OnlinePumpAmmSdk(connection);
+    const state = await onlineAmm.swapSolanaState(token.pool, PublicKey.default);
+    expected = sellBaseInput({ base: tokenAmount, slippage: 0, baseReserve: state.poolBaseAmount, quoteReserve: state.poolQuoteAmount, virtualQuoteReserves: state.pool.virtualQuoteReserves, globalConfig: state.globalConfig, baseMintAccount: state.baseMintAccount, baseMint: state.baseMint, coinCreator: state.pool.coinCreator, creator: state.pool.creator, feeConfig: state.feeConfig }).uiQuote;
+  }
+  const protectedAmount = expected.muln(10_000 - slippageBps).divn(10_000);
+  if (protectedAmount.isZero()) throw new Error('This token amount is too small to sell.');
   return protectedAmount;
 }
 export async function normalTokenAmountToBaseUnits(

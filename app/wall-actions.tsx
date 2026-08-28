@@ -12,6 +12,7 @@ import {
   executeTransferWinner,
   normalTokenAmountToBaseUnits,
   quotePumpBuyAmount,
+  quotePumpSellMinimum,
   validatePumpToken,
 } from './pump-execution';
 
@@ -33,6 +34,8 @@ export function WallActions() {
   const [keeperHasGas, setKeeperHasGas] = useState<boolean>();
   const [canSkipWinner, setCanSkipWinner] = useState(false);
   const [sendMaximum, setSendMaximum] = useState<{ display: string; baseUnits: string }>();
+  const [sellMaximum, setSellMaximum] = useState<{ display: string; baseUnits: string }>();
+  const [sellMinimumSol, setSellMinimumSol] = useState<string>();
   const [open, setOpen] = useState(false);
   const [title, setTitle] = useState('');
   const [rationale, setRationale] = useState('');
@@ -170,7 +173,24 @@ export function WallActions() {
     }, action === 'sendToken' ? 350 : 0);
     return () => { cancelled = true; window.clearTimeout(timer); };
   }, [action, connection, mint, open, program]);
-  const submit = async () => {
+  useEffect(() => {
+    let cancelled = false;
+    if (!open || !program || action !== 'sell' || !mint.trim()) {
+      setSellMaximum(undefined); setSellMinimumSol(undefined); return;
+    }
+    const timer = window.setTimeout(() => {
+      void fetchSellMaximum(connection, program, mint).then(async maximum => {
+        if (cancelled) return;
+        setSellMaximum(maximum);
+        if (!amount.trim()) { setSellMinimumSol(undefined); return; }
+        const target = new PublicKey(mint.trim());
+        const rawAmount = await normalTokenAmountToBaseUnits(connection, target, amount);
+        const minimum = await quotePumpSellMinimum(connection, target, rawAmount);
+        if (!cancelled) setSellMinimumSol(formatSol(minimum));
+      }).catch(() => { if (!cancelled) { setSellMaximum(undefined); setSellMinimumSol(undefined); } });
+    }, 350);
+    return () => { cancelled = true; window.clearTimeout(timer); };
+  }, [action, amount, connection, mint, open, program]);  const submit = async () => {
     if (!program || !wallet) { setNotice('Connect a wallet first.'); return; }
     if (roundState && (!('open' in roundState.status) || Math.floor(Date.now() / 1000) >= Number(roundState.closesAt.toString()))) {
       setOpen(false);
@@ -202,7 +222,7 @@ export function WallActions() {
         if (!mintInfo) throw new Error('This token mint does not exist.');
       }
 
-      const quoteLamports = action === 'buy' || action === 'sell' ? solToLamports(limit) : new BN(0);
+      const quoteLamports = action === 'buy' ? solToLamports(limit) : new BN(0);
       if (action === 'buy') {
         const vaultLamports = await connection.getBalance(vault, 'confirmed');
         const buyCap = new BN(calculateBuyCapLamports(treasuryState, vaultLamports));
@@ -222,7 +242,14 @@ export function WallActions() {
         if (rawAmount.gt(new BN(maximum.baseUnits))) {
           throw new Error(`The most this proposal can send right now is ${maximum.display} ${action === 'sendSol' ? 'SOL' : 'tokens'}.`);
         }
-      }      const actionValue = action === 'hold'
+      }
+      let sellMinimumOutput = new BN(0);
+      if (action === 'sell') {
+        const maximum = await fetchSellMaximum(connection, program, mint);
+        if (rawAmount.gt(new BN(maximum.baseUnits))) throw new Error(`The most this proposal can sell right now is ${maximum.display} tokens.`);
+        sellMinimumOutput = await quotePumpSellMinimum(connection, target, rawAmount);
+      }
+      const actionValue = action === 'hold'
         ? { hold: {} }
         : action === 'buy'
           ? { buyApprovedToken: {} }
@@ -234,7 +261,7 @@ export function WallActions() {
         target,
         amount: rawAmount,
         maximumAmount: action === 'buy' ? quoteLamports : new BN(0),
-        minimumOutput: action === 'sell' ? quoteLamports : new BN(0),
+        minimumOutput: sellMinimumOutput,
         maxSlippageBps: action === 'buy' || action === 'sell' ? 500 : 0,
         expiresAt: (roundState.closesAt as BN).add(new BN(600)),
         title: title.trim(),
@@ -370,9 +397,12 @@ export function WallActions() {
     ? proposals.find(({ account }) => (account.id as BN).eq(new BN(roundState.winningProposal.toString())))
     : undefined;
   const winnerExecuted = Boolean(winningProposal && 'executed' in winningProposal.account.status);
+  const hasRecordedWinner = roundState?.winningProposal !== null && roundState?.winningProposal !== undefined;
   const completedRoundMessage = winningProposal
     ? `Winner: ${winningProposal.account.title}. ${winnerExecuted ? 'The action is confirmed on-chain.' : 'The keeper is executing it now.'} The next round opens in about 10 seconds.`
-    : 'No proposal won this round. The next round opens in about 10 seconds.';
+    : hasRecordedWinner
+      ? 'A winner was selected on-chain. Loading its details while the keeper executes it.'
+      : 'No proposals were submitted in this round. The next round opens in about 10 seconds.';
 
   return <div className="wall-actions">
     <p className="vote-help"><b>HOW TO VOTE</b><span>Every live proposal has a +1 VOTE button. One vote starts at 0.01 SOL.</span></p>
@@ -394,10 +424,11 @@ export function WallActions() {
         {(action === 'buy' || action === 'sell' || action === 'sendToken') && <label>TOKEN MINT<input value={mint} onChange={event => setMint(event.target.value)} placeholder="Solana mint address"/></label>}
         {(action === 'sendSol' || action === 'sendToken') && <label>RECIPIENT WALLET<input value={recipient} onChange={event => setRecipient(event.target.value)} placeholder="Solana wallet address"/></label>}
         {(action === 'sell' || action === 'sendSol' || action === 'sendToken') && <label>{action === 'sell' ? 'TOKENS TO SELL' : action === 'sendSol' ? 'SOL TO SEND' : 'TOKENS TO SEND'}
-          <span className="amount-row"><input inputMode="decimal" value={amount} onChange={event => setAmount(event.target.value)} placeholder={action === 'sendSol' ? '0.01' : '100'}/>{(action === 'sendSol' || action === 'sendToken') && <button className="max-button" type="button" disabled={!sendMaximum} onClick={() => sendMaximum && setAmount(sendMaximum.display)}>MAX</button>}</span>
+          <span className="amount-row"><input inputMode="decimal" value={amount} onChange={event => setAmount(event.target.value)} placeholder={action === 'sendSol' ? '0.01' : '100'}/>{action === 'sell' ? <button className="max-button" type="button" disabled={!sellMaximum} onClick={() => sellMaximum && setAmount(sellMaximum.display)}>MAX</button> : <button className="max-button" type="button" disabled={!sendMaximum} onClick={() => sendMaximum && setAmount(sendMaximum.display)}>MAX</button>}</span>
+          {action === 'sell' && <small className="send-max">MAXIMUM NOW · {sellMaximum ? `${sellMaximum.display} TOKENS · 25% OF TREASURY BALANCE` : mint.trim() ? 'CALCULATING…' : 'ENTER A TOKEN MINT'}{sellMinimumSol ? ` · MINIMUM RETURN ${sellMinimumSol} SOL` : ''}</small>}
           {(action === 'sendSol' || action === 'sendToken') && <small className="send-max">MAXIMUM NOW · {sendMaximum ? `${sendMaximum.display} ${action === 'sendSol' ? 'SOL' : 'TOKENS'} · 5% OF TREASURY BALANCE` : action === 'sendToken' && !mint.trim() ? 'ENTER A TOKEN MINT' : 'CALCULATING…'}</small>}
         </label>}
-        {(action === 'buy' || action === 'sell') && <label>{action === 'buy' ? 'MAX SOL TO SPEND' + (maxBuySol === undefined ? '' : ' · CURRENT LIMIT ' + maxBuySol.toFixed(4)) : 'MIN SOL TO RECEIVE'}<input inputMode="decimal" value={limit} onChange={event => setLimit(event.target.value)} placeholder="0.05"/></label>}
+        {action === 'buy' && <label>{'MAX SOL TO SPEND' + (maxBuySol === undefined ? '' : ' · CURRENT LIMIT ' + maxBuySol.toFixed(4))}<input inputMode="decimal" value={limit} onChange={event => setLimit(event.target.value)} placeholder="0.05"/></label>}
         <div><button type="button" className="secondary" onClick={() => setOpen(false)}>NEVER MIND</button><button type="button" className="pitch-button" disabled={Boolean(busy)} onClick={() => void submit()}>{busy === 'proposal' ? 'ASKING WALLET…' : 'PUT IT ON-CHAIN'}</button></div>
       </div>)}
     {notice && <p className="chain-notice" role="status">{notice}</p>}
@@ -432,6 +463,20 @@ function formatBaseUnits(value: bigint, decimals: number) {
   const whole = padded.slice(0, -decimals);
   const fraction = padded.slice(-decimals).replace(/0+$/, '');
   return fraction ? `${whole}.${fraction}` : whole;
+}
+async function fetchSellMaximum(connection: any, program: any, mintValue: string) {
+  const mint = new PublicKey(mintValue.trim());
+  const mintInfo = await connection.getAccountInfo(mint, 'confirmed');
+  if (!mintInfo || (!mintInfo.owner.equals(TOKEN_PROGRAM_ID) && !mintInfo.owner.equals(TOKEN_2022_PROGRAM_ID))) throw new Error('This token mint is invalid.');
+  const [treasury] = PublicKey.findProgramAddressSync([new TextEncoder().encode('treasury')], program.programId);
+  const [vault] = PublicKey.findProgramAddressSync([new TextEncoder().encode('vault')], program.programId);
+  const state = await program.account.treasury.fetch(treasury);
+  const config = state.config as any;
+  const bps = BigInt(config.universalActionLimitBps ?? config.universal_action_limit_bps);
+  const source = getAssociatedTokenAddressSync(mint, vault, true, mintInfo.owner);
+  const balance = await connection.getTokenAccountBalance(source, 'confirmed');
+  const cap = BigInt(balance.value.amount) * bps / BigInt(10_000);
+  return { display: formatBaseUnits(cap, balance.value.decimals), baseUnits: cap.toString() };
 }
 function calculateBuyCapLamports(treasuryState: any, vaultLamports: number) {
   const actionBps = Number(treasuryState.config.universalActionLimitBps);

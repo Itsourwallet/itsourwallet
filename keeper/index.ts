@@ -63,6 +63,46 @@ async function openNextRound(round: PublicKey, roundState: any) {
   log('next round opened', { round: nextNumber.toString(), signature });
 }
 
+async function executeRecordedWinner(round: PublicKey, roundState: any) {
+  const winnerId = roundState.winningProposal as BN | null | undefined;
+  if (winnerId === null || winnerId === undefined) return 'none' as const;
+  const [proposal] = PublicKey.findProgramAddressSync(
+    [Buffer.from('proposal'), round.toBuffer(), u64Bytes(new BN(winnerId.toString()))],
+    programId,
+  );
+  let proposalState = await program.account.proposal.fetch(proposal);
+  if ('voting' in proposalState.status) {
+    if (dryRun) { log('dry-run: would mark winner', { round: (roundState.number as BN).toString(), proposal: proposal.toBase58() }); return 'pending' as const; }
+    const signature = await program.methods.markWinner().accounts({ keeper: keeper.publicKey, treasury, round, proposal }).rpc();
+    log('winner marked', { round: (roundState.number as BN).toString(), proposal: proposal.toBase58(), signature });
+    proposalState = await program.account.proposal.fetch(proposal);
+  }
+  if ('won' in proposalState.status) {
+    const expiresAt = Number((proposalState.expiresAt as BN).toString());
+    if (Math.floor(Date.now() / 1000) > expiresAt) {
+      log('winner expired without execution', { round: (roundState.number as BN).toString(), proposal: proposal.toBase58() });
+      return 'expired' as const;
+    }
+    if (dryRun) { log('dry-run: would execute winner', { round: (roundState.number as BN).toString(), proposal: proposal.toBase58() }); return 'pending' as const; }
+    let signature: string;
+    if ('hold' in proposalState.action) signature = await program.methods.executeHold().accounts({ keeper: keeper.publicKey, treasury, round, proposal }).rpc();
+    else if ('transferToApprovedRecipient' in proposalState.action) signature = await executeTransferWinner({ connection, program, keeper: keeper.publicKey, treasury, round, vault, proposal, proposalState });
+    else signature = await executePumpWinner({ connection, program, keeper: keeper.publicKey, treasury, round, vault, proposal, proposalState });
+    log('winner executed', { round: (roundState.number as BN).toString(), proposal: proposal.toBase58(), signature });
+    return 'executed' as const;
+  }
+  return 'executed' in proposalState.status ? 'executed' as const : 'pending' as const;
+}
+
+async function recoverSkippedWinners(currentNumber: BN) {
+  for (let offset = 1; offset <= 4 && currentNumber.gte(new BN(offset)); offset += 1) {
+    const number = currentNumber.sub(new BN(offset));
+    const [round] = PublicKey.findProgramAddressSync([Buffer.from('round'), treasury.toBuffer(), u64Bytes(number)], programId);
+    const roundState = await program.account.round.fetchNullable(round);
+    if (!roundState || !('settled' in roundState.status) || roundState.winningProposal === null || roundState.winningProposal === undefined) continue;
+    await executeRecordedWinner(round, roundState);
+  }
+}
 async function processRound() {
   if (active) return;
   active = true;
@@ -73,6 +113,7 @@ async function processRound() {
       return;
     }
     const treasuryState = await program.account.treasury.fetch(treasury);
+    await recoverSkippedWinners(treasuryState.roundNumber as BN);
     const roundNumber = treasuryState.roundNumber as BN;
     const [round] = PublicKey.findProgramAddressSync(
       [Buffer.from('round'), treasury.toBuffer(), u64Bytes(roundNumber)],
@@ -96,42 +137,8 @@ async function processRound() {
       roundState = await program.account.round.fetch(round);
     }
 
-    const winnerId = roundState.winningProposal as BN | null;
-    if (winnerId === null || winnerId === undefined) {
-      await openNextRound(round, roundState);
-      return;
-    }
-    const [proposal] = PublicKey.findProgramAddressSync(
-      [Buffer.from('proposal'), round.toBuffer(), u64Bytes(winnerId)],
-      programId,
-    );
-    let proposalState = await program.account.proposal.fetch(proposal);
-    if ('voting' in proposalState.status) {
-      if (dryRun) return log('dry-run: would mark winner', { round: roundNumber.toString(), proposal: proposal.toBase58() });
-      const signature = await program.methods.markWinner().accounts({ keeper: keeper.publicKey, treasury, round, proposal }).rpc();
-      log('winner marked', { round: roundNumber.toString(), proposal: proposal.toBase58(), signature });
-      proposalState = await program.account.proposal.fetch(proposal);
-    }
-    if ('won' in proposalState.status) {
-      const expiresAt = Number((proposalState.expiresAt as BN).toString());
-      if (Math.floor(Date.now() / 1000) > expiresAt) {
-        log('winner expired; opening next round without execution', { round: roundNumber.toString(), proposal: proposal.toBase58() });
-        await openNextRound(round, roundState);
-        return;
-      }
-      if (dryRun) return log('dry-run: would execute winner', { round: roundNumber.toString(), proposal: proposal.toBase58() });
-      let signature: string;
-      if ('hold' in proposalState.action) {
-        signature = await program.methods.executeHold().accounts({ keeper: keeper.publicKey, treasury, round, proposal }).rpc();
-      } else if ('transferToApprovedRecipient' in proposalState.action) {
-        signature = await executeTransferWinner({ connection, program, keeper: keeper.publicKey, treasury, round, vault, proposal, proposalState });
-      } else {
-        signature = await executePumpWinner({ connection, program, keeper: keeper.publicKey, treasury, round, vault, proposal, proposalState });
-      }
-      log('winner executed', { round: roundNumber.toString(), proposal: proposal.toBase58(), signature });
-      proposalState = await program.account.proposal.fetch(proposal);
-    }
-    if ('executed' in proposalState.status) await openNextRound(round, roundState);
+    const winnerResult = await executeRecordedWinner(round, roundState);
+    if (winnerResult === 'none' || winnerResult === 'executed' || winnerResult === 'expired') await openNextRound(round, roundState);
   } catch (error) {
     log('keeper cycle failed; will retry', { error: error instanceof Error ? error.message : String(error) });
   } finally {
